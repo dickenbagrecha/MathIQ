@@ -1,0 +1,1190 @@
+/* ─── Design tokens ──────────────────────────────────────────────────────
+ * Theme is set as a data-theme attribute on <html> by the pre-paint script
+ * in index.html; components reach colors via the T constants in
+ * src/design/tokens.ts.
+ */
+:root {
+  /* Clay, the default light palette — kept in sync with its theme block below.
+     This copy is only ever seen if the pre-paint script fails to run, since it
+     otherwise always stamps a data-theme. Every palette authors the same seven
+     slots. Hairlines are a solid color rather than an alpha of the ink because
+     a 12%-alpha light-on-dark hairline reads far weaker than the same alpha
+     dark-on-light, which turns every card boundary to mush on the dark
+     palettes. */
+  --paper: #f2e4dc;
+  --paper-2: #e9d6cb;
+  --hair: #d6b9a9;
+  --ink: #3a2823;
+  --muted: #7d6055;
+  --accent: #a4472f;
+  --accent-3: #ebd0c2;
+
+  color-scheme: light;
+
+  /* Always-light document surfaces (shared and printed student work). These
+     are the one pair no theme may touch — paper is paper. */
+  --doc-paper: #ffffff;
+  --doc-ink: #111111;
+  /* The camera stage is its own always-dark room, so its foreground is a
+     fixed light rather than the theme's paper. */
+  --stage-ink: #e8ece0;
+
+  --font-sans: 'DM Sans', ui-sans-serif, system-ui, sans-serif;
+  --font-serif: 'DM Sans', ui-sans-serif, system-ui, sans-serif;
+  --font-slab: 'DM Sans', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+
+  --pad-screen: 24px;
+  --gap-card: 12px;
+
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-out-quart: cubic-bezier(0.25, 1, 0.5, 1);
+}
+
+/* Derived from the seven authored slots, so a palette stays seven values.
+   The `[data-theme]` half matters: custom properties inherit their computed
+   value, so without it a themed swatch would inherit the root theme's
+   derivations instead of recomputing from its own. */
+:root,
+[data-theme] {
+  --hair-strong: color-mix(in srgb, var(--hair) 65%, var(--ink));
+  --accent-2: color-mix(in srgb, var(--accent) 70%, var(--paper));
+  /* Always darker than the base it covers, so it dims in both directions. */
+  --scrim: color-mix(in srgb, #000 62%, var(--paper));
+  /* Neutral, so it reads as depth on a cream body and doesn't try to be
+     separation on a dark one — the hairline carries that. */
+  --shadow: color-mix(in srgb, #000 30%, transparent);
+}
+
+/* ─── Themes ─────────────────────────────────────────────────────────────
+ * Deliberately unscoped selectors, NOT `:root[data-theme=…]`. Because they
+ * match any element, `<html data-theme>` themes the app and a swatch card
+ * `<div data-theme>` in Settings renders a live preview from the real tokens
+ * — no palette hex is duplicated into TypeScript.
+ */
+[data-theme='pistachio'] {
+  --paper: #d4e26a; --paper-2: #c8d65a; --hair: #becc60;
+  --ink: #1a2b1a; --muted: #4e5e30;
+  --accent: #1a4d6e; --accent-3: #3d6e5f;
+  color-scheme: light;
+}
+[data-theme='parchment'] {
+  --paper: #efe7d3; --paper-2: #e6dcc3; --hair: #d3c6a6;
+  --ink: #3a3222; --muted: #5f553f;
+  --accent: #7b5632; --accent-3: #e3d3b4;
+  color-scheme: light;
+}
+[data-theme='chalk'] {
+  --paper: #f5f6f4; --paper-2: #eaece8; --hair: #d2d6ce;
+  --ink: #16191a; --muted: #5c6360;
+  --accent: #1f5f8b; --accent-3: #dde6ed;
+  color-scheme: light;
+}
+[data-theme='clay'] {
+  --paper: #f2e4dc; --paper-2: #e9d6cb; --hair: #d6b9a9;
+  --ink: #3a2823; --muted: #7d6055;
+  --accent: #a4472f; --accent-3: #ebd0c2;
+  color-scheme: light;
+}
+[data-theme='warm-brown'] {
+  --paper: #1d2021; --paper-2: #282828; --hair: #3c3836;
+  --ink: #ebdbb2; --muted: #a89984;
+  --accent: #d5d639; --accent-3: #3e3d18;
+  color-scheme: dark;
+}
+[data-theme='soft-sage'] {
+  --paper: #272e33; --paper-2: #2e383c; --hair: #3d484d;
+  --ink: #d3c6aa; --muted: #9aa79d;
+  --accent: #c4d9a8; --accent-3: #3c4a34;
+  color-scheme: dark;
+}
+[data-theme='deep-swamp'] {
+  --paper: #10160f; --paper-2: #1a231a; --hair: #2a3529;
+  --ink: #dce3d3; --muted: #8a9683;
+  --accent: #9cb86a; --accent-3: #2c3d24;
+  color-scheme: dark;
+}
+[data-theme='moss-and-gold'] {
+  --paper: #191c13; --paper-2: #23271b; --hair: #34392a;
+  --ink: #e4e4d6; --muted: #93967f;
+  --accent: #ddbe6f; --accent-3: #453a1f;
+  color-scheme: dark;
+}
+
+[data-density='compact'] { --pad-screen: 16px; --gap-card: 8px; }
+[data-density='comfy']   { --pad-screen: 36px; --gap-card: 16px; }
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--paper);
+  color: var(--ink);
+  scroll-behavior: smooth;
+}
+
+body {
+  font-family: var(--font-sans);
+  font-size: 16px;
+  line-height: 1.4;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  /* Was 2s, and on background-color alone. A theme swap flips `color`
+     instantly, so the new ink sat on the old paper for two full seconds.
+     Both properties, fast enough to read as immediate. */
+  transition: background-color 200ms ease, color 200ms ease;
+}
+
+button { font-family: inherit; }
+input, textarea { font-family: inherit; color: inherit; }
+a { color: inherit; text-decoration: none; cursor: pointer; }
+::selection { background: var(--ink); color: var(--paper); }
+
+:focus { outline: none; }
+:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+}
+
+/* Visually-hidden text for screen readers (route announcements, etc.). */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Skip-to-content link — offscreen until keyboard-focused. */
+.skip-link {
+  position: absolute;
+  left: 8px;
+  top: -60px;
+  z-index: 100;
+  background: var(--ink);
+  color: var(--paper);
+  padding: 12px 18px;
+  font-family: var(--font-sans);
+  font-size: 14px;
+  font-weight: 600;
+  text-decoration: none;
+}
+.skip-link:focus-visible {
+  top: 8px;
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ─── Chamfered button — Carrot's signature 4px-notched corners ────── */
+.chamfer {
+  clip-path: polygon(
+    4px 0%,
+    0% 4px,
+    0% calc(100% - 4px),
+    4px 100%,
+    calc(100% - 4px) 100%,
+    100% calc(100% - 4px),
+    100% 4px,
+    calc(100% - 4px) 0%
+  );
+}
+
+/* ─── Landing "Or pick a subject" (Explore) ────────────────────────── */
+/* Each letter is two stacked copies inside a clipped box; hover rolls the
+   column up a line, in a left-to-right wave, so the accent copy lands where
+   the ink one was. Touch and keyboard get the same roll on :active and
+   :focus-visible, and the arrow is always showing, so nothing depends on
+   hover to read as a link. */
+.subject-index,
+.tool-block {
+  align-self: stretch;
+  width: 100%;
+  text-align: left;
+}
+.subject-index {
+  margin-top: clamp(56px, 10vh, 96px);
+  text-align: center;
+}
+.index-kicker {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.24em;
+  text-transform: uppercase;
+  color: var(--ink);
+}
+.index-rule {
+  flex: 1;
+  min-width: 24px;
+  height: 1px;
+  background: var(--ink);
+}
+.pick-subject {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3em;
+  min-height: 44px;
+  /* The left padding is where the operator sits, so the button's box — the
+     one hover target — runs unbroken from the operator through the words.
+     The right side matches it to keep the words centred. */
+  padding: 6px 0.9em;
+  background: transparent;
+  border: none;
+  font-family: var(--font-sans);
+  font-size: clamp(34px, 7vw, 56px);
+  font-weight: 700;
+  letter-spacing: -0.025em;
+  color: var(--ink);
+  cursor: pointer;
+}
+.pick-text {
+  display: inline-flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  column-gap: 0.25em;
+}
+.pick-word { display: inline-flex; white-space: nowrap; }
+.pick-char {
+  position: relative;
+  display: inline-block;
+  overflow: hidden;
+  /* Room for the descenders of p and j inside the clip. */
+  line-height: 1.2;
+}
+.pick-char > span {
+  display: block;
+  transition: transform 560ms var(--ease-out-expo);
+  transition-delay: calc(var(--i) * 22ms);
+}
+.pick-char > span + span {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  color: var(--accent);
+}
+.pick-operator {
+  /* Leads the words, as an operator acting on the headline, and stands a
+     little taller than them the way a typeset big operator does. */
+  position: absolute;
+  left: 0;
+  top: calc(50% - 0.575em);
+  pointer-events: none;
+  width: 0.69em;
+  height: 1.15em;
+  overflow: visible;
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 3.2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.pick-operator path { stroke-dasharray: 1; }
+/* Materializes: the stroke draws itself while the glyph resolves out of a
+   blur, rather than moving anywhere. */
+@keyframes operator-draw {
+  from { stroke-dashoffset: 1; }
+  to   { stroke-dashoffset: 0; }
+}
+@keyframes operator-materialize {
+  from { opacity: 0; filter: blur(6px); }
+  to   { opacity: 1; filter: blur(0); }
+}
+.pick-subject:active .pick-char > span,
+.pick-subject:focus-visible .pick-char > span { transform: translateY(-100%); }
+.pick-subject:active .pick-operator,
+.pick-subject:focus-visible .pick-operator {
+  animation: operator-materialize 900ms var(--ease-out-quart) both;
+}
+.pick-subject:active .pick-operator path,
+.pick-subject:focus-visible .pick-operator path {
+  animation: operator-draw 900ms var(--ease-out-expo) both;
+}
+.pick-subject:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 6px;
+}
+@media (hover: hover) {
+  .pick-subject:hover .pick-char > span { transform: translateY(-100%); }
+  /* Pointer devices keep it hidden until hover; touch has no hover, so there
+     it stays as the cue that the headline is a link. */
+  .pick-operator {
+    opacity: 0;
+    filter: blur(6px);
+    transition:
+      opacity 500ms var(--ease-out-quart),
+      filter 700ms var(--ease-out-quart);
+  }
+  .pick-subject:hover .pick-operator {
+    opacity: 1;
+    filter: blur(0);
+  }
+  .pick-subject:hover .pick-operator path {
+    animation: operator-draw 900ms var(--ease-out-expo) both;
+  }
+}
+
+/* ─── Landing tool row (Handwritten to PDF) — an add-on, not a peer ─── */
+.tool-block { margin-top: clamp(40px, 7vh, 64px); }
+.tool-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-areas:
+    'tag   arrow'
+    'title arrow'
+    'sub   arrow';
+  align-items: center;
+  column-gap: 14px;
+  row-gap: 4px;
+  width: 100%;
+  margin-top: 14px;
+  padding: 14px 16px;
+  background: transparent;
+  border: 1px solid var(--hair);
+  font-family: inherit;
+  color: var(--ink);
+  text-align: left;
+  cursor: pointer;
+  transition:
+    border-color 220ms var(--ease-out-quart),
+    background 220ms var(--ease-out-quart);
+}
+.tool-row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+@media (hover: hover) {
+  .tool-row:hover {
+    border-color: var(--ink);
+    background: var(--paper-2);
+  }
+}
+.tool-tag {
+  grid-area: tag;
+  justify-self: start;
+  margin-bottom: 4px;
+  padding: 4px 8px;
+  background: var(--accent);
+  color: var(--paper);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.tool-title {
+  grid-area: title;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.3;
+}
+.tool-sub {
+  grid-area: sub;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--muted);
+}
+.tool-arrow {
+  grid-area: arrow;
+  font-size: 18px;
+  color: var(--muted);
+}
+
+/* ─── Feature showcase cards (signed-out landing only) ─────────────── */
+.landing-feature-card {
+  background: var(--paper);
+  border: 1px solid var(--hair);
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  transition:
+    border-color 220ms var(--ease-out-quart),
+    background 220ms var(--ease-out-quart),
+    transform 260ms var(--ease-out-expo);
+}
+.landing-feature-card:hover {
+  border-color: var(--ink);
+  background: var(--paper-2);
+  transform: translateY(-1px);
+}
+.landing-feature-card.is-expanded {
+  border-color: var(--ink);
+  background: var(--paper-2);
+  transform: none;
+}
+.landing-feature-card .feature-card-header {
+  background: transparent;
+  border: none;
+  padding: 18px 18px 20px;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-areas:
+    "kicker indicator"
+    "title indicator"
+    "sub sub";
+  align-items: start;
+  gap: 4px 12px;
+  width: 100%;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+  min-height: 44px; /* tap target */
+}
+.landing-feature-card .feature-card-header:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.landing-feature-card .cta-kicker {
+  grid-area: kicker;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+}
+.landing-feature-card .feature-card-title {
+  grid-area: title;
+  font-family: var(--font-sans);
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  line-height: 1.25;
+  margin: 2px 0 4px;
+  color: var(--ink);
+}
+.landing-feature-card .feature-card-sub {
+  grid-area: sub;
+  font-size: 13px;
+  color: var(--muted);
+  line-height: 1.5;
+  margin: 0;
+}
+.landing-feature-card .feature-card-indicator {
+  grid-area: indicator;
+  align-self: center;
+  font-family: var(--font-mono);
+  font-size: 18px;
+  line-height: 1;
+  color: var(--muted);
+  width: 24px;
+  text-align: center;
+  user-select: none;
+}
+.landing-feature-card.is-expanded .feature-card-indicator {
+  color: var(--ink);
+}
+.landing-feature-card .feature-card-details {
+  padding: 0 18px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  border-top: 1px solid var(--hair);
+  margin-top: -2px;
+  padding-top: 16px;
+  animation: feature-details-in 220ms var(--ease-out-quart);
+}
+.landing-feature-card .feature-card-deep {
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--ink);
+  margin: 0;
+  max-width: 640px;
+}
+.landing-feature-card .feature-card-cta {
+  align-self: flex-start;
+  background: var(--accent);
+  color: var(--paper);
+  border: none;
+  padding: 10px 18px;
+  font-size: 13px;
+  font-weight: 600;
+  font-family: var(--font-sans);
+  text-decoration: none;
+  cursor: pointer;
+}
+@keyframes feature-details-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .landing-feature-card { transition: none; }
+  .landing-feature-card:hover { transform: none; }
+  .landing-feature-card .feature-card-details { animation: none; }
+}
+
+/* ─── Disclosure cards (per-problem grading breakdown) ─────────────── */
+.disclosure {
+  transition: background-color 180ms var(--ease-out-quart);
+}
+.disclosure summary {
+  list-style: none;
+  cursor: pointer;
+  user-select: none;
+}
+.disclosure summary::-webkit-details-marker { display: none; }
+.disclosure summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.disclosure summary:hover .chev { color: var(--ink); }
+.disclosure .chev {
+  transition: transform 200ms var(--ease-out-quart), color 120ms ease;
+  color: var(--muted);
+  flex-shrink: 0;
+  display: inline-flex;
+}
+.disclosure[open] .chev { transform: rotate(180deg); }
+.disclosure .reveal {
+  animation: disclosure-reveal 220ms var(--ease-out-quart) both;
+}
+/* ReactMarkdown wraps content in <p> with default browser margins —
+ * collapse those so feedback hugs the hairline border above. */
+.feedback-md > :first-child { margin-top: 0; }
+.feedback-md > :last-child  { margin-bottom: 0; }
+.feedback-md p { margin: 0 0 8px; }
+.feedback-md p:last-of-type { margin-bottom: 0; }
+@keyframes disclosure-reveal {
+  from { opacity: 0; transform: translateY(-2px); }
+  to   { opacity: 1; transform: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .disclosure .chev,
+  .disclosure .reveal { transition: none; animation: none; }
+}
+
+/* ─── Upgrade prompt modal ──────────────────────────────────────────── */
+.upgrade-backdrop {
+  position: fixed;
+  inset: 0;
+  background: var(--scrim);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  z-index: 1000;
+  animation: upgrade-fade 220ms var(--ease-out-quart) both;
+}
+.upgrade-card {
+  position: relative;
+  max-width: 480px;
+  width: 100%;
+  padding: 28px 26px 24px;
+  animation: upgrade-rise 320ms var(--ease-out-expo) both;
+  box-shadow: 0 20px 60px var(--shadow);
+  max-height: calc(100vh - 40px);
+  overflow-y: auto;
+}
+@keyframes upgrade-fade {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@keyframes upgrade-rise {
+  from { opacity: 0; transform: translateY(16px) scale(0.98); }
+  to   { opacity: 1; transform: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .upgrade-backdrop,
+  .upgrade-card { animation: none; }
+}
+@media (max-width: 480px) {
+  .upgrade-backdrop { padding: 12px; align-items: flex-end; }
+  .upgrade-card { padding: 22px 18px 18px; }
+}
+
+/* ─── Animations ────────────────────────────────────────────────────── */
+@keyframes reveal-up {
+  from { opacity: 0; transform: translateY(14px); }
+  to   { opacity: 1; transform: none; }
+}
+@keyframes page-enter {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: none; }
+}
+
+.reveal     { animation: reveal-up 700ms var(--ease-out-expo) both; }
+.reveal-1   { animation-delay: 60ms; }
+.reveal-2   { animation-delay: 140ms; }
+.reveal-3   { animation-delay: 220ms; }
+.reveal-4   { animation-delay: 300ms; }
+.reveal-5   { animation-delay: 380ms; }
+
+.page-enter { animation: page-enter 360ms var(--ease-out-expo) both; }
+
+.stagger-children > * {
+  animation: reveal-up 600ms var(--ease-out-expo) both;
+}
+.stagger-children > *:nth-child(1) { animation-delay: 60ms; }
+.stagger-children > *:nth-child(2) { animation-delay: 120ms; }
+.stagger-children > *:nth-child(3) { animation-delay: 180ms; }
+.stagger-children > *:nth-child(4) { animation-delay: 240ms; }
+.stagger-children > *:nth-child(5) { animation-delay: 300ms; }
+.stagger-children > *:nth-child(6) { animation-delay: 360ms; }
+.stagger-children > *:nth-child(7) { animation-delay: 420ms; }
+.stagger-children > *:nth-child(8) { animation-delay: 480ms; }
+.stagger-children > *:nth-child(n+9) { animation-delay: 520ms; }
+
+/* ─── Microinteractions ───────────────────────────────────────────── */
+.lift {
+  transition: transform 280ms var(--ease-out-expo),
+              border-color 200ms;
+}
+.lift:hover {
+  transform: translateY(-2px);
+  border-color: var(--ink);
+}
+.lift:active { transform: translateY(0); }
+
+.btn-press {
+  transition: transform 120ms var(--ease-out-quart),
+              background 200ms,
+              color 200ms;
+}
+.btn-press:active { transform: scale(0.98); }
+
+.arrow-nudge {
+  display: inline-block;
+  transition: transform 280ms var(--ease-out-expo);
+}
+.lift:hover .arrow-nudge,
+.btn-press:hover .arrow-nudge { transform: translateX(4px); }
+
+/* ─── Course card hover: accent stripe + title shift ──────────────── */
+.course-card { position: relative; overflow: hidden; }
+.course-card::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 0;
+  background: var(--accent);
+  transition: width 240ms var(--ease-out-expo);
+}
+.course-card:hover::before { width: 4px; }
+.course-card .card-title {
+  transition: transform 280ms var(--ease-out-expo);
+}
+.course-card:hover .card-title { transform: translateX(6px); }
+
+/* ─── Type-in caret for the day kicker ─────────────────────────── */
+.type-caret {
+  display: inline-block;
+  width: 0.55em;
+  height: 0.85em;
+  margin-left: 2px;
+  vertical-align: -0.07em;
+  background: var(--ink);
+  animation: caret-blink 900ms steps(2, end) infinite;
+}
+@keyframes caret-blink {
+  0%, 50% { opacity: 1; }
+  50.01%, 100% { opacity: 0; }
+}
+
+/* ─── Landing hero stage: daily figure over the math entry ────────── */
+.hero-stage {
+  width: 100%;
+  /* Was 560px, to frame a figure. The entry wants the full column. */
+  max-width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 18px;
+}
+
+.scribe-hint {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: transparent;
+  transition: color 200ms;
+
+  /* A band of ink travelling left to right through muted text. The gradient
+     is three times the width of the text with the bright band at its centre,
+     so sliding it one full text-width carries the band from just off the left
+     edge to just off the right. Clipped to the glyphs, so it reads as the
+     letters lighting up in sequence rather than a highlight passing over. */
+  background-image: linear-gradient(
+    90deg,
+    var(--muted) 0%,
+    var(--muted) 40%,
+    var(--ink) 50%,
+    var(--muted) 60%,
+    var(--muted) 100%
+  );
+  background-size: 300% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  animation: scribe-sweep 3.6s linear infinite;
+}
+/* Keep this *below* the `.scribe-hint` declarations it overrides. A media
+   query adds no specificity, so up with the other reduced-motion blocks it
+   tied with the base rule and lost on source order — leaving the hint
+   transparent, and the fallback resting entirely on the
+   `animation-duration: 0.01ms !important` sweep at the end of this file.
+   No sweep — and the hint needs its color back, since the animated version
+   paints through a gradient with transparent text. */
+@media (prefers-reduced-motion: reduce) {
+  .scribe-hint {
+    animation: none;
+    background-image: none;
+    color: var(--muted);
+  }
+}
+@keyframes scribe-sweep {
+  /* Higher percentages push the image left, so counting down walks the
+     bright band rightward across the text. */
+  from { background-position: 100% 0; }
+  to   { background-position: 0% 0; }
+}
+
+.search-form { width: 100%; }
+
+/* ─── Math entry — the MathLive field and our own keypad ──────────── */
+.math-entry {
+  width: 100%;
+  /* The hero column is centred; the formula and the keys read left-to-right. */
+  text-align: left;
+}
+
+.math-entry math-field {
+  display: block;
+  width: 100%;
+  min-height: 72px;
+  padding: 16px 18px;
+  border: 1px solid var(--ink);
+  background: var(--paper);
+  color: var(--ink);
+  font-size: 22px;
+  /* MathLive paints its own chrome from these. Left unset they stay its
+     stock blues, which read as a foreign UI dropped onto the palette. */
+  --caret-color: var(--accent);
+  --primary: var(--accent);
+  --selection-background-color: color-mix(in srgb, var(--accent) 22%, var(--paper));
+  --contains-highlight-background-color: color-mix(in srgb, var(--accent) 12%, var(--paper));
+  --placeholder-color: var(--muted);
+  --smart-fence-color: var(--muted);
+}
+/* Outline rather than a shadow: separation on this app is carried by ink
+   contrast, and a focus ring still has to be unmissable. */
+.math-entry math-field:focus-within {
+  border-color: var(--accent);
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.math-keypad {
+  margin-top: 12px;
+  border: 1px solid var(--ink);
+  background: var(--paper-2);
+}
+/* The dividers are 1px gaps over a hairline ground — a border-right can't draw
+   the seam once the strip wraps. */
+.math-keypad-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1px;
+  background: var(--hair-strong);
+  border-bottom: 1px solid var(--ink);
+}
+.math-keypad-tab {
+  /* Fits all four on one row at 375px; "Relations" is the widest at 89px. */
+  flex: 1 1 auto;
+  min-width: 72px;
+  min-height: 44px;
+  padding: 10px 6px;
+  background: var(--paper-2);
+  border: none;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink);
+  cursor: pointer;
+  transition: background-color 160ms ease, color 160ms ease;
+}
+.math-keypad-tab[aria-selected="true"] {
+  background: var(--ink);
+  color: var(--paper);
+}
+
+.math-keypad-grid {
+  display: grid;
+  /* 52px floor keeps five columns at 375px and grows the count from there. */
+  grid-template-columns: repeat(auto-fill, minmax(52px, 1fr));
+  gap: 6px;
+  padding: 10px;
+}
+.math-keypad-key {
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--hair-strong);
+  background: var(--paper);
+  color: var(--ink);
+  cursor: pointer;
+  transition: background-color 160ms ease, color 160ms ease, border-color 160ms ease;
+}
+/* :active matches :hover so a phone, which has neither hover nor a virtual
+   keyboard here, still gets feedback on the press. */
+.math-keypad-key:hover:not(:disabled),
+.math-keypad-key:active:not(:disabled) {
+  background: var(--accent);
+  color: var(--paper);
+  border-color: var(--accent);
+}
+.math-keypad-key:disabled { opacity: 0.45; cursor: not-allowed; }
+/* KaTeX draws the key faces — let them inherit so the invert takes the
+   glyph with it instead of leaving ink-on-accent. */
+.math-keypad-key .katex { color: inherit; font-size: 1em; }
+/* The keys carrying a word rather than a formula. */
+.math-keypad-word {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.06em;
+}
+/* Caret and delete, sharing the key styling but sitting above the tabs. */
+.math-keypad-nav {
+  display: flex;
+  gap: 6px;
+  padding: 10px;
+  border-bottom: 1px solid var(--hair-strong);
+}
+.math-keypad-nav .math-keypad-key { flex: 1; }
+
+/* ─── Responsive padding utility ──────────────────────────────────── */
+.responsive-pad { padding: 24px 20px; }
+@media (min-width: 600px) { .responsive-pad { padding: 32px 32px; } }
+@media (min-width: 900px) { .responsive-pad { padding: 40px 48px; } }
+
+/* ─── Markdown body — typography for streamed walkthroughs ───────── */
+.markdown-body p { margin: 0 0 12px; }
+.markdown-body p:last-child { margin-bottom: 0; }
+.markdown-body strong { font-weight: 700; }
+.markdown-body em { font-style: italic; }
+.markdown-body code {
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+  background: var(--paper-2);
+  padding: 1px 5px;
+}
+.markdown-body pre {
+  background: var(--paper-2);
+  border: 1px solid var(--hair-strong);
+  padding: 10px 12px;
+  overflow-x: auto;
+  font-size: 13px;
+}
+.markdown-body ul, .markdown-body ol { margin: 0 0 12px 20px; }
+.markdown-body li { margin: 2px 0; }
+.markdown-body h1, .markdown-body h2, .markdown-body h3 {
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  margin: 20px 0 8px;
+}
+.markdown-body h1 { font-size: 22px; }
+.markdown-body h2 { font-size: 19px; }
+.markdown-body h3 { font-size: 17px; }
+.markdown-body blockquote {
+  margin: 0 0 12px;
+  padding: 4px 0 4px 14px;
+  border-left: 2px solid var(--ink);
+}
+.markdown-body .katex-display { margin: 10px 0; overflow-x: auto; }
+
+/* ─── Scribe line art ────────────────────────────────────────────────────
+ * The scribe PNGs are flat dark-green line art on transparency, so on the
+ * dark palettes the landing hero simply disappears. Rather than ship ten
+ * recolored copies, the <img> is kept purely for its intrinsic size (the
+ * layout depends on the image sizing itself — see Landing.tsx) and hidden,
+ * while a masked overlay paints the same alpha in the live --ink.
+ */
+.scribe-art { position: relative; display: inline-block; }
+/* The img is invisible — it is here to give the box the drawing's intrinsic
+   proportions, which the two masked layers below then paint into. */
+.scribe-art img { opacity: 0; }
+/* Subjects sizes and places its copy from the stylesheet so the squished
+   layout can override it. Landing bounds its own inline, for the reason
+   written there. */
+.scribe-slot { justify-content: flex-end; padding-right: clamp(0px, 3vw, 32px); }
+.scribe-slot .scribe-art img {
+  display: block;
+  height: clamp(120px, 18vw, 180px);
+  width: auto;
+  max-width: 100%;
+}
+.scribe-art::before,
+.scribe-art::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+}
+/* The regions the line art encloses — the tub's porcelain, a robe — are bare
+   transparency, so they showed the page and the figure read as a wireframe on
+   the dark palettes. The companion asset's alpha is exactly those regions,
+   painted a surface tone so the figure keeps a body in any theme. */
+/* Light palettes keep the drawing as line art: the body is a lift toward the
+   ink (1.7:1 against the page, strokes still clearing 4.2:1 on top of it).
+   Dark palettes invert it instead — a light body carrying dark strokes — so
+   the figure reads as drawn rather than as a negative of itself. The first
+   declaration of each pair is the pre-light-dark() fallback. */
+.scribe-art::before {
+  background: color-mix(in srgb, var(--paper) 72%, var(--ink));
+  background: light-dark(color-mix(in srgb, var(--paper) 72%, var(--ink)), var(--ink));
+  -webkit-mask: var(--scribe-fill) center / contain no-repeat;
+  mask: var(--scribe-fill) center / contain no-repeat;
+}
+.scribe-art::after {
+  background: var(--ink);
+  background: light-dark(var(--ink), var(--paper));
+  -webkit-mask: var(--scribe) center / contain no-repeat;
+  mask: var(--scribe) center / contain no-repeat;
+}
+
+/* Below this the Subjects hero wraps to one column — the same 600px the
+   padding steps at — and the drawing gets a whole row to itself. Sized by
+   height it sits in the corner of all that space at its desktop size, so
+   size it by the row instead and centre it. The height cap is what keeps a
+   tall scribe from taking the whole screen on a short phone. */
+@media (max-width: 600px) {
+  .scribe-slot { justify-content: center; padding-right: 0; }
+  /* Still driven by height, so every day's drawing reads the same size
+     whatever its proportions. 62vw is what keeps the widest of them —
+     Friday, 455x336 — inside the row rather than into the page gutter: the
+     span is shrink-to-fit, so a max-width on the image resolves against the
+     image and cannot rescue it. */
+  .scribe-slot .scribe-art img { height: clamp(180px, 62vw, 260px); }
+  /* Every drawing is exported inside a wide transparent margin — the ink is
+     only about half its canvas — so `contain` spends half the box on nothing
+     and the figure reads tiny however big the box gets. The box is
+     height-driven with width:auto, so it carries the canvas's own aspect
+     ratio and `contain` is exactly 100%: overshooting that scales about the
+     centre and crops 17% off each edge. The tightest margin of the seven
+     (Friday, 18%) still clears it, so this eats padding and never ink. */
+  .scribe-slot .scribe-art::before,
+  .scribe-slot .scribe-art::after {
+    -webkit-mask-size: 150%;
+    mask-size: 150%;
+  }
+  /* Written for the one-word day label it replaced; against a full sentence
+     it never gets room and lands as a stray 24px dash. */
+  .kicker-rule { display: none; }
+}
+
+/* ─── Constraints / utilities ─────────────────────────────────────── */
+img, svg { max-width: 100%; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ─── Print mode — used for PDF export of walkthroughs + exams ────── */
+/* The print-host is rendered via React Portal directly under document.body
+ * (as a sibling of #root). On screen it's pushed offscreen so it doesn't
+ * disturb the app layout. During print, #root is hidden entirely so the
+ * print-host paginates from page 1 with no upstream layout dragging it
+ * downstream. */
+.print-host {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+}
+@media print {
+  #root { display: none !important; }
+
+  /* Theme tokens must never reach paper. The .markdown-body rules paint code
+     in --paper-2 and rules in --ink; on a dark palette that prints near-black
+     on near-black and silently ruins a paid export. Every print host is a
+     .print-host, so neutralizing here covers print-doc, exam-doc and
+     homework-doc at once. */
+  html, body { background: #fff !important; }
+  .print-host code,
+  .print-host pre {
+    background: var(--doc-paper) !important;
+    border-color: #999 !important;
+    color: var(--doc-ink) !important;
+  }
+  .print-host blockquote { border-left-color: var(--doc-ink) !important; }
+  .print-host {
+    position: static !important;
+    left: auto !important;
+    top: auto !important;
+    width: auto !important;
+    height: auto !important;
+    overflow: visible !important;
+    background: #fff !important;
+  }
+  .print-doc {
+    color: #000;
+    background: #fff;
+    font-family: 'DM Sans', system-ui, sans-serif;
+    font-size: 11pt;
+    line-height: 1.55;
+    padding: 0.6in 0.7in;
+    max-width: none;
+  }
+  .print-doc .markdown-body { color: #000; }
+  .print-doc h1 { font-size: 18pt; margin: 0 0 4pt; }
+  .print-doc .print-meta {
+    font-size: 9pt;
+    color: #555;
+    margin-bottom: 14pt;
+    padding-bottom: 8pt;
+    border-bottom: 1px solid #000;
+  }
+  .print-doc .print-footer {
+    margin-top: 18pt;
+    padding-top: 8pt;
+    border-top: 1px solid #ccc;
+    font-size: 8pt;
+    color: #777;
+    text-align: center;
+  }
+  .print-doc .markdown-body p,
+  .print-doc .markdown-body li,
+  .print-doc .markdown-body .katex-display {
+    page-break-inside: avoid;
+  }
+  .print-doc .katex { font-size: 1.05em; }
+
+  /* Exam document — generous work space between problems */
+  .exam-doc {
+    color: #000;
+    background: #fff;
+    font-family: 'DM Sans', system-ui, sans-serif;
+    font-size: 12pt;
+    line-height: 1.55;
+    padding: 0.6in 0.7in;
+  }
+  .exam-doc .exam-header {
+    text-align: center;
+    border-bottom: 2px solid #000;
+    padding-bottom: 14pt;
+    margin-bottom: 18pt;
+  }
+  .exam-doc .exam-course {
+    font-size: 10pt;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: #444;
+    margin-bottom: 4pt;
+  }
+  .exam-doc .exam-title {
+    font-size: 24pt;
+    font-weight: 700;
+    margin: 0 0 10pt;
+    letter-spacing: -0.02em;
+  }
+  .exam-doc .exam-meta {
+    font-size: 11pt;
+    color: #222;
+    margin-bottom: 8pt;
+  }
+  .exam-doc .exam-instructions {
+    font-size: 10pt;
+    color: #444;
+    font-style: italic;
+  }
+  .exam-doc .exam-problem {
+    page-break-inside: avoid;
+    margin-bottom: 14pt;
+    border-top: 1px solid #999;
+    padding-top: 10pt;
+  }
+  .exam-doc .exam-problem:first-of-type {
+    border-top: none;
+    padding-top: 0;
+  }
+  .exam-doc .exam-problem-label {
+    font-size: 11pt;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+  }
+  .exam-doc .exam-problem-topic {
+    font-size: 9pt;
+    color: #666;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    margin-bottom: 6pt;
+  }
+  .exam-doc .exam-problem-body { color: #000; font-size: 12pt; }
+  .exam-doc .exam-problem-body .katex { font-size: 1.05em; }
+  /* Each problem gets ~3 inches of blank work space before the next */
+  .exam-doc .exam-workspace {
+    min-height: 3in;
+    border-bottom: 1px dashed #ccc;
+    margin-top: 8pt;
+  }
+  .exam-doc .print-footer {
+    margin-top: 24pt;
+    padding-top: 8pt;
+    border-top: 1px solid #ccc;
+    font-size: 8pt;
+    color: #777;
+    text-align: center;
+  }
+
+  /* Homework document — clean academic transcription of student work */
+  .homework-doc {
+    color: #000;
+    background: #fff;
+    font-family: 'DM Sans', system-ui, sans-serif;
+    font-size: 12pt;
+    line-height: 1.55;
+    padding: 0.6in 0.7in;
+  }
+  .homework-doc .homework-header {
+    border-bottom: 1.5px solid #000;
+    padding-bottom: 10pt;
+    margin-bottom: 16pt;
+  }
+  .homework-doc .homework-title {
+    font-size: 22pt;
+    font-weight: 700;
+    margin: 0 0 4pt;
+    letter-spacing: -0.02em;
+  }
+  .homework-doc .homework-meta {
+    font-size: 10pt;
+    color: #666;
+    letter-spacing: 0.04em;
+  }
+  .homework-doc .homework-body { color: #000; font-size: 12pt; }
+  .homework-doc .homework-body p,
+  .homework-doc .homework-body li,
+  .homework-doc .homework-body .katex-display {
+    page-break-inside: avoid;
+  }
+  .homework-doc .homework-body .katex { font-size: 1.05em; }
+  .homework-doc .homework-body h1 { font-size: 14pt; margin: 14pt 0 6pt; }
+  .homework-doc .homework-body h2 { font-size: 13pt; margin: 12pt 0 6pt; }
+  .homework-doc .homework-body h3 { font-size: 12pt; margin: 10pt 0 4pt; }
+  .homework-doc .print-footer {
+    margin-top: 24pt;
+    padding-top: 8pt;
+    border-top: 1px solid #ccc;
+    font-size: 8pt;
+    color: #777;
+    text-align: center;
+  }
+}

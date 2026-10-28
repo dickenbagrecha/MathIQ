@@ -1,0 +1,155 @@
+/**
+ * Snapshot of an in-progress walkthrough.
+ *
+ * Everything that defines "where the student is" — the streamed text, the
+ * revealed step count, the per-step Why & How expansions — otherwise lives
+ * only in `TopicScreen`'s local state. Any remount loses it, and remounts are
+ * routine: the app has no URL for the topic route, so a refresh, an OAuth
+ * round-trip, or a magic link opened in another tab all drop the student back
+ * on the landing page with their work gone.
+ *
+ * This module is the one place that shape is written down. It is device-local
+ * by design — the account-level copy is the history record, written once the
+ * walkthrough is complete and the user is signed in.
+ */
+import {
+  KEY_WALKTHROUGH_SESSION,
+  readString,
+  removeKey,
+  writeString,
+} from '../lib/storage';
+import type { PromptFlow } from './promptFlow';
+
+/** Snapshots older than this are ignored and dropped on the next read. */
+const MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+/** A walkthrough long enough to threaten the localStorage quota isn't worth
+ *  evicting the user's other preferences for. Roughly 4x the largest real
+ *  walkthrough we've seen. */
+const MAX_BUFFER_CHARS = 200_000;
+
+/** Bump when the shape changes — older snapshots are then simply discarded
+ *  rather than half-restored into a component that no longer matches.
+ *
+ *  2: practice runs now carry their invented statement in `problem` like any
+ *  other. A v1 snapshot has `problem: null` with the statement buried in the
+ *  buffer preamble, which the current screen has no way to read back. */
+const VERSION = 2;
+
+export interface WalkthroughSession {
+  v: typeof VERSION;
+  courseId: string;
+  topicId: string;
+  /** The problem being walked through — including one Iris invented, which is
+   *  settled before the walkthrough starts. Null only when the run is against
+   *  the topic's canonical example. */
+  problem: string | null;
+  /** True when `problem` was invented by "Try one like this" rather than typed
+   *  or taken from the topic. Drives the PRACTICE PROBLEM kicker. */
+  practice: boolean;
+  mode: PromptFlow;
+  buffer: string;
+  streamDone: boolean;
+  revealCount: number;
+  whyHow: Record<number, string>;
+  expanded: Record<number, boolean>;
+  /** True once this walkthrough has been written to the user's history, so a
+   *  restored session can't be saved a second time on every later visit. */
+  savedToHistory: boolean;
+  updatedAt: number;
+}
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
+// The values matter as much as the container: a `whyHow` entry that isn't a
+// string reaches MathMarkdown as its child, and an `expanded` entry that
+// isn't a boolean is read as one anyway.
+function isRecordOfStrings(v: unknown): v is Record<number, string> {
+  return isPlainObject(v) && Object.values(v).every((x) => typeof x === 'string');
+}
+
+function isRecordOfBooleans(v: unknown): v is Record<number, boolean> {
+  return isPlainObject(v) && Object.values(v).every((x) => typeof x === 'boolean');
+}
+
+/** Returns null for anything missing, malformed, stale, or from an older
+ *  shape. Never throws — a corrupt snapshot must not take down the render. */
+export function readSession(): WalkthroughSession | null {
+  const raw = readString(KEY_WALKTHROUGH_SESSION);
+  if (!raw) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    removeKey(KEY_WALKTHROUGH_SESSION);
+    return null;
+  }
+  const s = parsed as Partial<WalkthroughSession>;
+  if (
+    !s ||
+    s.v !== VERSION ||
+    typeof s.courseId !== 'string' ||
+    typeof s.topicId !== 'string' ||
+    typeof s.buffer !== 'string' ||
+    typeof s.updatedAt !== 'number' ||
+    !isRecordOfStrings(s.whyHow) ||
+    !isRecordOfBooleans(s.expanded)
+  ) {
+    removeKey(KEY_WALKTHROUGH_SESSION);
+    return null;
+  }
+  if (Date.now() - s.updatedAt > MAX_AGE_MS) {
+    removeKey(KEY_WALKTHROUGH_SESSION);
+    return null;
+  }
+  return {
+    v: VERSION,
+    courseId: s.courseId,
+    topicId: s.topicId,
+    problem: typeof s.problem === 'string' ? s.problem : null,
+    practice: s.practice === true,
+    mode: s.mode === 'all' ? 'all' : 'step',
+    buffer: s.buffer,
+    streamDone: s.streamDone === true,
+    revealCount: typeof s.revealCount === 'number' ? s.revealCount : 0,
+    whyHow: s.whyHow,
+    expanded: s.expanded,
+    savedToHistory: s.savedToHistory === true,
+    updatedAt: s.updatedAt,
+  };
+}
+
+/** Writes the snapshot, stamping `updatedAt`.
+ *
+ *  A no-op when there is nothing to save. Deliberately *not* a clear: a topic
+ *  the student has only just opened has an empty buffer, and treating that as
+ *  "discard" would throw away the in-progress walkthrough they left on a
+ *  different topic. Only `clearSession` discards. */
+export function writeSession(
+  session: Omit<WalkthroughSession, 'v' | 'updatedAt'>,
+): void {
+  if (!session.buffer.trim()) return;
+  if (session.buffer.length > MAX_BUFFER_CHARS) return;
+  writeString(
+    KEY_WALKTHROUGH_SESSION,
+    JSON.stringify({ ...session, v: VERSION, updatedAt: Date.now() }),
+  );
+}
+
+export function clearSession(): void {
+  removeKey(KEY_WALKTHROUGH_SESSION);
+}
+
+/** Flips `savedToHistory` in place. Read-modify-write rather than a full
+ *  snapshot argument so the caller doesn't have to reassemble state it may no
+ *  longer hold. */
+export function markSessionSaved(): void {
+  const current = readSession();
+  if (!current || current.savedToHistory) return;
+  writeString(
+    KEY_WALKTHROUGH_SESSION,
+    JSON.stringify({ ...current, savedToHistory: true }),
+  );
+}

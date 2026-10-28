@@ -1,0 +1,2033 @@
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { SignInButton, useAuth, useUser } from '@clerk/clerk-react';
+import { T } from '../design/tokens';
+import { kicker, breadcrumb } from '../design/primitives';
+import { COURSES_BY_ID } from '../walkthroughs/courses';
+import {
+  WalkthroughError,
+  streamWalkthrough,
+  type ModelChoice,
+  type RateLimitInfo,
+} from '../walkthroughs/generate';
+import { fetchUsage } from '../walkthroughs/usage';
+import { fetchSubscriptionState } from '../billing/client';
+// Aliased: this component already has a local `isPaid` boolean for the
+// current walkthrough's tier.
+import { isPaid as isPaidTier } from '../walkthroughs/tier';
+import { ModelPicker } from '../components/ModelPicker';
+import { ClassifyError, classifyTopic } from '../walkthroughs/classify';
+import { looksLikeProblem } from '../walkthroughs/isProblem';
+import { saveHistoryRecord } from '../walkthroughs/history';
+import { extractProblemFromImage, OcrError } from '../walkthroughs/ocr';
+import { verifyWalkthrough, type Verdict } from '../walkthroughs/verify';
+import { getPromptFlow, type PromptFlow } from '../state/promptFlow';
+import { usePracticeDifficulty } from '../state/practiceDifficulty';
+import { DifficultyPicker } from '../components/DifficultyPicker';
+import { useScrambledElement } from '../state/useScrambledElement';
+import {
+  clearSession,
+  markSessionSaved,
+  readSession,
+  writeSession,
+  type WalkthroughSession,
+} from '../state/walkthroughSession';
+import { isTopicBookmarked, toggleTopicBookmark } from '../state/bookmarks';
+import { useUpgradePrompt } from '../upgrade/UpgradePrompt';
+import { openScanner } from '../scanner';
+import { CheckIcon, BookmarkIcon } from '../design/icons';
+import { MathMarkdown, INLINE_COMPONENTS } from '../components/MathMarkdown';
+import { createRafBatcher } from '../lib/rafBatch';
+import { NotFound } from './NotFound';
+import type { Route } from '../router';
+
+interface TopicScreenProps {
+  courseId: string;
+  topicId: string;
+  initialProblem?: string;
+  onNavigate: (route: Route) => void;
+}
+
+type LimitStatus = 'sign-in-required' | 'rate-limited' | 'error' | null;
+
+interface RateLimitDisplay {
+  message: string;
+  resetAt?: string;
+}
+
+type StreamTarget =
+  | null
+  | 'walkthrough'
+  | { kind: 'why-how'; index: number };
+
+// Step markers vary by model drift. Match any of these line-starts:
+//   `**Step 1.**`, `**Step 1:**`, `**Step 1**`        — bold form (preferred)
+//   `**Step 1: Identify u and dv**`                    — bold spanning whole heading
+//   `### Step 1`, `## Step 1:`                          — markdown heading form
+//   `Step 1:` / `Step 1.` at the start of a line       — bare form
+// Anchored to start-of-line (multi-line flag) so a "Step 3" mentioned in
+// body prose never splits the stream.
+const STEP_MARKER = /^\s*(?:\*\*\s*Step\s+\d+|#{1,6}\s+Step\s+\d+|Step\s+\d+\s*[:.])/gim;
+
+// Iris is told to write a statement and stop. These catch it when it doesn't:
+// a leading `*Practice problem.*` label, or a solution it started anyway.
+const SOLUTION_MARKER =
+  /^\s*(?:\*{1,2}\s*|#{1,6}\s+)?(?:Step\s+\d+|Answer\s*[:.])/im;
+const LABEL_MARKER =
+  /^\s*(?:\*{1,2}|#{1,6}\s+)?Practice problem\s*[.:]?\s*(?:\*{1,2})?\s*/i;
+
+/** Which problem the card under the strategic anchor is showing. `practice`
+ *  carries null until the invented statement has finished arriving. */
+type FocusProblem =
+  | { kind: 'example'; text: string }
+  | { kind: 'custom'; text: string }
+  | { kind: 'practice'; text: string | null };
+
+const FOCUS_KICKER: Record<FocusProblem['kind'], string> = {
+  example: 'EXAMPLE PROBLEM',
+  custom: 'YOUR PROBLEM',
+  practice: 'PRACTICE PROBLEM',
+};
+
+interface ParsedStream {
+  /** Text before the first `**Step N**` marker. Null if empty. */
+  preamble: string | null;
+  /** Segments where the *next* marker has arrived, or stream is done. */
+  complete: string[];
+  /** For each complete segment, where it ends in the raw buffer — so a
+   *  why-how can name "everything through this step" as an offset into the
+   *  text exactly as it streamed, rather than re-joining trimmed pieces. */
+  ends: number[];
+  /** Currently-arriving last segment, while streaming. Null when done or no markers seen. */
+  streamingTail: string | null;
+}
+
+function parseStream(buffer: string, done: boolean): ParsedStream {
+  if (!buffer.trim()) {
+    return { preamble: null, complete: [], ends: [], streamingTail: null };
+  }
+  const positions: number[] = [];
+  STEP_MARKER.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = STEP_MARKER.exec(buffer)) !== null) positions.push(m.index);
+  if (positions.length === 0) {
+    // No step markers yet. While streaming, show buffer as preamble so an
+    // opening line renders as it arrives; on done with no markers at all,
+    // treat the whole thing as a single complete segment.
+    return done
+      ? { preamble: null, complete: [buffer.trim()], ends: [buffer.length], streamingTail: null }
+      : { preamble: buffer.trim() || null, complete: [], ends: [], streamingTail: null };
+  }
+  const preamble = buffer.slice(0, positions[0]).trim() || null;
+  const complete: string[] = [];
+  const ends: number[] = [];
+  for (let i = 0; i < positions.length - 1; i++) {
+    complete.push(buffer.slice(positions[i], positions[i + 1]).trim());
+    ends.push(positions[i + 1]);
+  }
+  const tail = buffer.slice(positions[positions.length - 1]).trim();
+  if (done) {
+    complete.push(tail);
+    ends.push(buffer.length);
+    return { preamble, complete, ends, streamingTail: null };
+  }
+  return { preamble, complete, ends, streamingTail: tail };
+}
+
+/**
+ * Trims an invented problem back to the statement.
+ *
+ * The invent prompt asks for the statement alone, but this runs on Haiku at
+ * every tier and Haiku is the model this codebase already documents as
+ * drifting from format instructions (see FORMAT_REINFORCEMENT in
+ * worker/src/anthropic.ts). The two drifts that would actually break the card
+ * are a restated label, which duplicates the kicker above it, and a solution,
+ * which hands the student the answer to a problem they were asked to try. So
+ * cut at the first step or answer marker and drop a leading label.
+ */
+function cleanInventedProblem(raw: string): string {
+  const cut = raw.search(SOLUTION_MARKER);
+  const statement = cut === -1 ? raw : raw.slice(0, cut);
+  return statement.replace(LABEL_MARKER, '').trim();
+}
+
+export function TopicScreen({
+  courseId,
+  topicId,
+  initialProblem,
+  onNavigate,
+}: TopicScreenProps) {
+  const course = COURSES_BY_ID[courseId];
+  const topic = course?.topics.find((t) => t.id === topicId);
+  const { getToken, isSignedIn, isLoaded } = useAuth();
+  const { user } = useUser();
+  const userId = user?.id ?? null;
+  const { requireUpgrade } = useUpgradePrompt();
+
+  const [bookmarked, setBookmarked] = useState<boolean>(() =>
+    isTopicBookmarked(courseId, topicId, userId),
+  );
+
+  useEffect(() => {
+    setBookmarked(isTopicBookmarked(courseId, topicId, userId));
+    const handleSync = () => setBookmarked(isTopicBookmarked(courseId, topicId, userId));
+    window.addEventListener('mathiq:bookmarks-changed', handleSync);
+    window.addEventListener('storage', handleSync);
+    return () => {
+      window.removeEventListener('mathiq:bookmarks-changed', handleSync);
+      window.removeEventListener('storage', handleSync);
+    };
+  }, [courseId, topicId, userId]);
+
+  // A walkthrough left in progress on this device. Read exactly once per
+  // mount, before any state is seeded, so a reload or a sign-in round-trip
+  // lands the student back on the step they were reading rather than on an
+  // empty topic page. The ref (rather than useMemo) guarantees the read can't
+  // repeat after we start writing snapshots of our own.
+  const restoredRef = useRef<WalkthroughSession | null | undefined>(undefined);
+  if (restoredRef.current === undefined) {
+    const saved = readSession();
+    const matches =
+      saved !== null &&
+      saved.courseId === courseId &&
+      saved.topicId === topicId &&
+      // Arriving with a *different* problem is a new request, not a resume —
+      // the snapshot must not suppress it or shadow it on screen.
+      (!initialProblem || saved.problem === initialProblem);
+    restoredRef.current = matches ? saved : null;
+  }
+  const restored = restoredRef.current;
+
+  const [buffer, setBuffer] = useState(() => restored?.buffer ?? '');
+  const [streamDone, setStreamDone] = useState(() => restored?.streamDone ?? false);
+  const [sessionMode, setSessionMode] = useState<PromptFlow>(() => restored?.mode ?? 'step');
+  // Max is opt-in per problem and never sticks — after a run this drops back
+  // to 'standard' so the budget can only ever be spent deliberately.
+  const [modelChoice, setModelChoice] = useState<ModelChoice>('standard');
+  const [sessionModel, setSessionModel] = useState<ModelChoice>('standard');
+  // True when the problem in focus was invented by "Try one like this" rather
+  // than typed or taken from the topic. Only decides the kicker now: the
+  // statement itself is settled before any walkthrough runs, so a practice
+  // problem re-runs on Max like any other.
+  const [sessionPractice, setSessionPractice] = useState(() => restored?.practice ?? false);
+  // The invented statement. Held apart from `problemForSession` because it
+  // exists on its own for as long as the student is just looking at it.
+  const [practiceProblem, setPracticeProblem] = useState<string | null>(
+    () => (restored?.practice ? restored.problem : null) ?? null,
+  );
+  const [inventing, setInventing] = useState(false);
+  const inventAbortRef = useRef<AbortController | null>(null);
+  const [maxRemaining, setMaxRemaining] = useState<number | undefined>();
+  const [canChooseModel, setCanChooseModel] = useState(false);
+  const [usageResolved, setUsageResolved] = useState(false);
+  const [revealCount, setRevealCount] = useState(() => restored?.revealCount ?? 0);
+  const [problemForSession, setProblemForSession] = useState<string | undefined>(
+    () => restored?.problem ?? undefined,
+  );
+  const [streaming, setStreaming] = useState<StreamTarget>(null);
+
+  const [whyHow, setWhyHow] = useState<Record<number, string>>(() => restored?.whyHow ?? {});
+  const [whyHowStream, setWhyHowStream] = useState<{ index: number; text: string } | null>(null);
+  const [expanded, setExpanded] = useState<Record<number, boolean>>(
+    () => restored?.expanded ?? {},
+  );
+
+  const [limitStatus, setLimitStatus] = useState<LimitStatus>(null);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [rateInfo, setRateInfo] = useState<RateLimitInfo | null>(null);
+  const [limitDetail, setLimitDetail] = useState<RateLimitDisplay | null>(null);
+  const [customProblem, setCustomProblem] = useState(
+    initialProblem ?? restored?.problem ?? '',
+  );
+  const [classifying, setClassifying] = useState(false);
+  const [submitHint, setSubmitHint] = useState<string | null>(null);
+  const walkthroughAbortRef = useRef<AbortController | null>(null);
+  const whyHowAbortRef = useRef<AbortController | null>(null);
+  const classifyAbortRef = useRef<AbortController | null>(null);
+  const [ocrState, setOcrState] = useState<'idle' | 'reading' | 'error'>('idle');
+  const [ocrMessage, setOcrMessage] = useState<string | null>(null);
+
+  const verifyAbortRef = useRef<AbortController | null>(null);
+  const [verifyState, setVerifyState] = useState<'idle' | 'verifying' | Verdict>('idle');
+  const [verifyReason, setVerifyReason] = useState<string | null>(null);
+
+  const [copiedSolution, setCopiedSolution] = useState(false);
+  const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'failed'>(
+    () => (restored?.savedToHistory ? 'saved' : 'idle'),
+  );
+  // Mirrors saveState's "this walkthrough is in the user's history" bit, but
+  // readable from callbacks without adding it to their dependency arrays.
+  // Restored sessions carry it forward so a resume can't double-save.
+  const savedToHistoryRef = useRef(restored?.savedToHistory ?? false);
+
+  const [practiceDifficulty, setPracticeDifficulty] = usePracticeDifficulty();
+
+  const parsed = useMemo(() => parseStream(buffer, streamDone), [buffer, streamDone]);
+
+  // ── The problem in focus ────────────────────────────────────────────────
+  // Exactly one problem occupies the card under the strategic anchor: the
+  // topic's canonical example until a run replaces it, then whatever is
+  // actually being walked through. Derived rather than stored, so a restored
+  // session reproduces the right card straight from the snapshot.
+  const focus = useMemo<FocusProblem>(() => {
+    // `practiceProblem` is only ever set once the invent stream has finished —
+    // a target that moves under the scramble just thrashes — so until then
+    // this carries null and the card shows why.
+    if (sessionPractice) return { kind: 'practice', text: practiceProblem };
+    const own = problemForSession?.trim();
+    if (own) return { kind: 'custom', text: own };
+    // Sending no problem is what makes the worker substitute its own copy of
+    // the canonical example, so on this path the example really is the problem
+    // being walked through.
+    return { kind: 'example', text: topic?.exampleProblem ?? '' };
+  }, [sessionPractice, practiceProblem, problemForSession, topic]);
+
+  // The decode fires only when the focused problem genuinely becomes a
+  // different one. Whatever was on screen at mount — a cold open on the
+  // canonical example, or a session restored from a snapshot — is not
+  // something the student just asked for, so it is captured once here and
+  // never decodes.
+  //
+  // This flag must stay *stable* for the whole animation. An earlier version
+  // tracked "has it settled yet" in a passive effect, which reads the values
+  // of its own render: on the render where a new target arrives the hook's
+  // state is still the previous settled one, so the effect recorded the new
+  // target as already-settled before a single frame had drawn, flipped this
+  // flag false, and cancelled the decode about 30ms in.
+  const scrambleTarget = focus.kind === 'example' ? null : focus.text;
+  const mountedWithRef = useRef(scrambleTarget);
+  const scrambleEnabled =
+    scrambleTarget !== null && scrambleTarget !== mountedWithRef.current;
+  // Decodes the rendered output in place, so there is no plain-text phase and
+  // nothing to hand off to — the typeset math is what scrambles.
+  const problemRef = useRef<HTMLDivElement | null>(null);
+  useScrambledElement(problemRef, scrambleTarget, scrambleEnabled);
+
+  // Coalesce per-chunk setState into one commit per animation frame. setState
+  // setters are stable across renders, so creating the batchers once is safe.
+  const bufferBatcher = useMemo(() => createRafBatcher(setBuffer), []);
+  const whyHowStreamBatcher = useMemo(
+    () => createRafBatcher<{ index: number; text: string } | null>(setWhyHowStream),
+    [],
+  );
+
+  // Auto-reveal the first segment as soon as it lands.
+  useEffect(() => {
+    if (revealCount === 0 && parsed.complete.length > 0) {
+      setRevealCount(1);
+    }
+  }, [parsed.complete.length, revealCount]);
+
+  // Seed the Max budget before the user types anything. Response headers keep
+  // it current after that. Re-runs when `isSignedIn` settles: on first paint
+  // Clerk hasn't hydrated, so `getToken` yields null and /api/usage answers
+  // with the anonymous snapshot — a paid user would be stuck behind a locked
+  // picker for the rest of the session without the refetch.
+  useEffect(() => {
+    const ctrl = new AbortController();
+    // A new auth state invalidates the previous answer.
+    setUsageResolved(false);
+    void (async () => {
+      const usage = await fetchUsage({ getToken, signal: ctrl.signal }).catch(() => null);
+      if (ctrl.signal.aborted) return;
+      if (usage) {
+        setCanChooseModel(usage.canChooseModel);
+        setMaxRemaining(usage.opusDaily?.remaining);
+        setUsageResolved(true);
+        return;
+      }
+      // No snapshot. Entitlement still decides whether the picker works at
+      // all, and the billing endpoint can answer that on its own, so fall
+      // back to the tier rather than leaving the control dead. The budget
+      // stays unknown, which renders Max without a count instead of not at
+      // all.
+      const sub = await fetchSubscriptionState({ getToken }).catch(() => null);
+      if (ctrl.signal.aborted) return;
+      setCanChooseModel(isPaidTier(sub?.tier));
+      setMaxRemaining(undefined);
+      setUsageResolved(true);
+    })();
+    return () => ctrl.abort();
+  }, [isSignedIn, getToken]);
+
+  // The pre-hydration fetch resolves too, but with the anonymous snapshot —
+  // so a resolved fetch only counts once Clerk has settled.
+  const modelReady = isLoaded && usageResolved;
+
+  useEffect(() => {
+    // A restored session already holds the walkthrough for this problem.
+    // Re-running would spend a quota slot to overwrite text we just recovered.
+    if (!restoredRef.current && initialProblem && course && topic) {
+      void runWalkthrough(initialProblem);
+    }
+    return () => {
+      walkthroughAbortRef.current?.abort();
+      whyHowAbortRef.current?.abort();
+      inventAbortRef.current?.abort();
+      classifyAbortRef.current?.abort();
+      verifyAbortRef.current?.abort();
+      bufferBatcher.cancel();
+      whyHowStreamBatcher.cancel();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialProblem, courseId, topicId]);
+
+  // Keep the latest snapshot readable from listeners that outlive a render.
+  // Assigned in an effect (rather than during render) so a discarded render
+  // pass can't leave a stale value behind.
+  const snapshotRef = useRef<Omit<WalkthroughSession, 'v' | 'updatedAt'> | null>(null);
+  useEffect(() => {
+    snapshotRef.current = {
+      courseId,
+      topicId,
+      problem: problemForSession ?? practiceProblem ?? null,
+      practice: sessionPractice,
+      mode: sessionMode,
+      buffer,
+      streamDone,
+      revealCount,
+      whyHow,
+      expanded,
+      savedToHistory: savedToHistoryRef.current,
+    };
+  });
+
+  // Persist at checkpoints, not per chunk. `buffer` is deliberately absent
+  // from the dependency array: it changes once per animation frame while
+  // streaming, and serialising a growing string that often is pure waste. The
+  // effect still reads the *current* buffer whenever one of the listed deps
+  // moves, which covers every moment the student's place actually changes —
+  // the stream finishing, a step being revealed, a Why & How landing or being
+  // toggled.
+  useEffect(() => {
+    const snapshot = snapshotRef.current;
+    if (!snapshot?.buffer.trim()) return;
+    writeSession(snapshot);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [streamDone, revealCount, whyHow, expanded]);
+
+  // A tab closed or backgrounded mid-stream never hits a checkpoint, so catch
+  // it here — this is the case where the student has the most to lose.
+  useEffect(() => {
+    const onHide = () => {
+      if (document.visibilityState !== 'hidden') return;
+      const snapshot = snapshotRef.current;
+      if (!snapshot?.buffer.trim()) return;
+      writeSession(snapshot);
+    };
+    document.addEventListener('visibilitychange', onHide);
+    return () => document.removeEventListener('visibilitychange', onHide);
+  }, []);
+
+  // Signing in mid-walkthrough is the whole point of this: the completion-time
+  // auto-save only fires for users who were already signed in, so a
+  // walkthrough generated anonymously would otherwise never reach an account.
+  // Keyed on `isSignedIn` alone — `getToken` is not referentially stable
+  // across Clerk hydration, so including it would re-fire this spuriously.
+  useEffect(() => {
+    if (!isSignedIn) return;
+    if (savedToHistoryRef.current) return;
+    if (!buffer.trim()) return;
+    // Mid-stream, the completion path is about to save the full text. Saving
+    // the partial buffer here would leave two records for one walkthrough.
+    if (streaming === 'walkthrough') return;
+    if (!course || !topic) return;
+
+    savedToHistoryRef.current = true;
+    setSaveState('saving');
+    void (async () => {
+      const result = await saveHistoryRecord({
+        getToken,
+        courseId: course.id,
+        topicId: topic.id,
+        problem: problemForSession ?? practiceProblem ?? null,
+        walkthrough: buffer,
+        modelUsed: rateInfo?.modelUsed ?? null,
+      });
+      if (result) {
+        markSessionSaved();
+        setSaveState('saved');
+      } else {
+        // Let a later mount retry rather than silently dropping the record.
+        savedToHistoryRef.current = false;
+        setSaveState('failed');
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isSignedIn]);
+
+  if (!course || !topic) {
+    return (
+      <NotFound
+        message="That topic doesn't exist — it may have been renamed or removed."
+        onNavigate={onNavigate}
+      />
+    );
+  }
+
+  // The textarea that starts most runs sits at the bottom of the page while
+  // the walkthrough renders at the top, so without this a submit looks like it
+  // did nothing.
+  //
+  // The whole page, not the card. Scrolling the card to the top of the
+  // viewport hides the breadcrumb, title and strategic anchor above it, which
+  // overshoots what the student wants to see; from the top all four are in
+  // frame and there is nothing to overshoot. App.tsx does the same on route
+  // changes.
+  function scrollToTop() {
+    const reduce = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+    window.scrollTo({ top: 0, behavior: reduce ? 'auto' : 'smooth' });
+  }
+
+  function resetSession() {
+    walkthroughAbortRef.current?.abort();
+    whyHowAbortRef.current?.abort();
+    verifyAbortRef.current?.abort();
+    // These two too: a run that starts while an invent or a classify is still
+    // in flight would otherwise have that older request's error land on top
+    // of it. Their flags are cleared by hand because an aborted run returns
+    // before its own cleanup.
+    inventAbortRef.current?.abort();
+    classifyAbortRef.current?.abort();
+    setInventing(false);
+    setClassifying(false);
+    bufferBatcher.cancel();
+    whyHowStreamBatcher.cancel();
+    setVerifyState('idle');
+    setVerifyReason(null);
+    setSaveState('idle');
+    setBuffer('');
+    setStreamDone(false);
+    setRevealCount(0);
+    setWhyHow({});
+    setWhyHowStream(null);
+    setExpanded({});
+    setLimitStatus(null);
+    setErrorMsg(null);
+    setLimitDetail(null);
+    // A new run supersedes whatever was stored — never leave a snapshot of the
+    // previous walkthrough behind for the next mount to restore.
+    savedToHistoryRef.current = false;
+    restoredRef.current = null;
+    snapshotRef.current = null;
+    clearSession();
+  }
+
+  /** Puts the page back the way it opens: canonical example in the card, both
+   *  generate buttons and the difficulty slider back, nothing in the textarea.
+   *
+   *  resetSession clears the walkthrough itself but deliberately leaves the
+   *  request that produced it — a re-run needs to know what it is re-running —
+   *  so the fields that decide *which* problem is in focus are cleared here.
+   *  Streaming is one of them: aborting the controller makes runWalkthrough
+   *  return before its own cleanup, which is why the stop button also sets
+   *  this by hand. */
+  function clearWalkthrough() {
+    resetSession();
+    setStreaming(null);
+    setProblemForSession(undefined);
+    setSessionPractice(false);
+    setPracticeProblem(null);
+    setSessionModel('standard');
+    setModelChoice('standard');
+    setRateInfo(null);
+    setCustomProblem('');
+    setSubmitHint(null);
+    setOcrState('idle');
+    setOcrMessage(null);
+    scrollToTop();
+  }
+
+  // Every response carries the current budget, so the picker stays accurate
+  // without a refetch.
+  function handleRateInfo(info: RateLimitInfo) {
+    setRateInfo(info);
+    if (info.opusDailyRemaining !== undefined) {
+      setMaxRemaining(info.opusDailyRemaining);
+      setCanChooseModel(true);
+      setUsageResolved(true);
+    }
+  }
+
+  async function runWalkthrough(
+    problem?: string,
+    opts?: { invented?: boolean; model?: ModelChoice },
+  ) {
+    resetSession();
+    const mode = getPromptFlow();
+    setSessionMode(mode);
+    setProblemForSession(problem);
+
+    // Snapshot the model for this run, so changing the chips mid-stream can't
+    // misreport what produced the output. An auto-run from the landing page
+    // passes nothing and gets Standard — an implicit run is never a
+    // deliberate spend.
+    const model = opts?.model ?? modelChoice;
+    setSessionModel(model);
+    setSessionPractice(!!opts?.invented);
+
+    walkthroughAbortRef.current?.abort();
+    const controller = new AbortController();
+    walkthroughAbortRef.current = controller;
+    setStreaming('walkthrough');
+
+    let accumulated = '';
+    try {
+      for await (const chunk of streamWalkthrough({
+        course: course!,
+        topic: topic!,
+        problem,
+        signal: controller.signal,
+        getToken,
+        onRateLimitInfo: handleRateInfo,
+        action: 'walkthrough',
+        model,
+      })) {
+        accumulated += chunk;
+        bufferBatcher.push(accumulated);
+      }
+      // An abort that lands after the last chunk resolves the read as done
+      // rather than rejecting it, so the catch below never sees it. Without
+      // this the finished run would paint over whatever replaced it.
+      if (controller.signal.aborted) return;
+      bufferBatcher.flush();
+      setStreamDone(true);
+      setStreaming((s) => (s === 'walkthrough' ? null : s));
+      // Max never carries over to the next problem.
+      setModelChoice('standard');
+      if (mode === 'all') {
+        // Reveal everything immediately.
+        const { complete } = parseStream(accumulated, true);
+        setRevealCount(complete.length);
+      }
+      // Fire verification in the background if the walkthrough actually
+      // produced an answer. Non-blocking; we render the badge when it lands.
+      if (/\*\*Answer:\*\*/i.test(accumulated)) {
+        void runVerify(accumulated);
+      }
+      // Auto-save to history for signed-in users. Surface the save state so
+      // the user can see it land (and notice if it ever fails silently).
+      if (isSignedIn && accumulated.trim()) {
+        setSaveState('saving');
+        savedToHistoryRef.current = true;
+        void (async () => {
+          const result = await saveHistoryRecord({
+            getToken,
+            courseId: course!.id,
+            topicId: topic!.id,
+            problem: problem ?? null,
+            walkthrough: accumulated,
+            modelUsed: rateInfo?.modelUsed ?? null,
+          });
+          if (result) {
+            // Records the save on the snapshot too, so restoring this session
+            // later doesn't file a duplicate.
+            markSessionSaved();
+          } else {
+            savedToHistoryRef.current = false;
+          }
+          setSaveState(result ? 'saved' : 'failed');
+        })();
+      }
+    } catch (err) {
+      if (controller.signal.aborted) return;
+      bufferBatcher.cancel();
+      setStreaming((s) => (s === 'walkthrough' ? null : s));
+      handleStreamError(err);
+    }
+  }
+
+  /**
+   * "Try one like this" — asks Iris for a problem statement and stops there.
+   *
+   * A separate action from the walkthrough on purpose: it runs on Haiku, costs
+   * no walkthrough slot, and leaves the usage pill alone (the worker sends no
+   * rate-limit headers back for it). The student looks at the problem, re-rolls
+   * it as often as they like, and only spends a slot when they press Walk me
+   * through it.
+   */
+  async function runInvent() {
+    resetSession();
+    setProblemForSession(undefined);
+    setSessionPractice(true);
+    setPracticeProblem(null);
+    setSessionModel('standard');
+
+    inventAbortRef.current?.abort();
+    const controller = new AbortController();
+    inventAbortRef.current = controller;
+    setInventing(true);
+
+    let accumulated = '';
+    try {
+      for await (const chunk of streamWalkthrough({
+        course: course!,
+        topic: topic!,
+        signal: controller.signal,
+        getToken,
+        onRateLimitInfo: handleRateInfo,
+        action: 'invent',
+        // Inventing is never worth a Max slot — the worker pins it to Haiku
+        // anyway, and sending 'max' would only misreport what produced it.
+        model: 'standard',
+        difficulty: practiceDifficulty,
+      })) {
+        accumulated += chunk;
+      }
+      if (controller.signal.aborted) return;
+      // Published in one go rather than per chunk: the decode measures the
+      // rendered glyphs, so a statement still growing under it would restart
+      // the animation on every frame.
+      setPracticeProblem(cleanInventedProblem(accumulated) || null);
+      setInventing(false);
+    } catch (err) {
+      if (controller.signal.aborted) return;
+      setInventing(false);
+      handleStreamError(err);
+    }
+  }
+
+  async function requestWhyHow(index: number) {
+    setExpanded((p) => ({ ...p, [index]: true }));
+    if (whyHow[index] !== undefined) return;
+
+    // Abort only any prior why-how stream — leave the walkthrough alone.
+    whyHowAbortRef.current?.abort();
+    const controller = new AbortController();
+    whyHowAbortRef.current = controller;
+    setStreaming({ kind: 'why-how', index });
+    setWhyHowStream({ index, text: '' });
+
+    // The worker slices the walkthrough itself, from the text exactly as it
+    // streamed, so it can prove the assistant turn is its own before
+    // replaying it. `ends` is where the target step stops in that raw text;
+    // the preamble comes along because it precedes the first step.
+    const sliceEnd = parsed.ends[index];
+
+    let accumulated = '';
+    try {
+      for await (const chunk of streamWalkthrough({
+        course: course!,
+        topic: topic!,
+        problem: problemForSession,
+        signal: controller.signal,
+        getToken,
+        onRateLimitInfo: handleRateInfo,
+        action: 'why-how',
+        walkthroughFull: buffer,
+        sliceEnd,
+        // A follow-up explanation isn't worth a Max slot.
+        model: 'standard',
+      })) {
+        accumulated += chunk;
+        whyHowStreamBatcher.push({ index, text: accumulated });
+      }
+      if (controller.signal.aborted) return;
+      whyHowStreamBatcher.flush();
+      setWhyHow((p) => ({ ...p, [index]: accumulated }));
+      setWhyHowStream(null);
+      setStreaming((s) =>
+        s && typeof s === 'object' && s.kind === 'why-how' && s.index === index ? null : s,
+      );
+    } catch (err) {
+      if (controller.signal.aborted) return;
+      whyHowStreamBatcher.cancel();
+      setWhyHowStream(null);
+      setStreaming((s) =>
+        s && typeof s === 'object' && s.kind === 'why-how' && s.index === index ? null : s,
+      );
+      handleStreamError(err);
+    }
+  }
+
+  function handleStreamError(err: unknown) {
+    if (err instanceof WalkthroughError) {
+      if (err.kind === 'sign_in_required') {
+        setLimitStatus('sign-in-required');
+        setLimitDetail({ message: err.message });
+        return;
+      }
+      if (err.kind === 'rate_limit') {
+        setLimitStatus('rate-limited');
+        setLimitDetail({ message: err.message, resetAt: err.data?.resetAt });
+        return;
+      }
+    }
+    setLimitStatus('error');
+    setErrorMsg(humanError(err));
+  }
+
+  async function runVerify(walkthroughText: string) {
+    verifyAbortRef.current?.abort();
+    const controller = new AbortController();
+    verifyAbortRef.current = controller;
+    setVerifyState('verifying');
+    setVerifyReason(null);
+    try {
+      const res = await verifyWalkthrough({ walkthrough: walkthroughText, getToken, signal: controller.signal });
+      if (controller.signal.aborted) return;
+      if (!res) {
+        // Network/upstream failure — fail open quietly; no badge instead of a false "correct".
+        setVerifyState('idle');
+        return;
+      }
+      setVerifyState(res.verdict);
+      setVerifyReason(res.reason);
+    } catch (err) {
+      if (err instanceof Error && err.name === 'AbortError') return;
+      setVerifyState('idle');
+    }
+  }
+
+  async function handleImageFile(file: File) {
+    if (!file.type.startsWith('image/')) {
+      setOcrState('error');
+      setOcrMessage('Pick an image file (JPG, PNG, or WebP).');
+      return;
+    }
+    setOcrState('reading');
+    setOcrMessage(null);
+    try {
+      const text = await extractProblemFromImage({ getToken, file });
+      setCustomProblem(text);
+      setOcrState('idle');
+      setSubmitHint(null);
+    } catch (err) {
+      setOcrState('error');
+      if (err instanceof OcrError) setOcrMessage(err.message);
+      else setOcrMessage('Image processing failed — try again.');
+    }
+  }
+
+  async function attemptPhotoInput() {
+    const out = await openScanner({ mode: 'single', output: 'image' });
+    if (out && out.kind === 'image') {
+      void handleImageFile(out.file);
+    }
+  }
+
+  async function onImageButtonClick() {
+    // Photo input is Plus+. Free users get a small lifetime trial — if
+    // they have one available, the upgrade modal exposes a "Try free"
+    // button that invokes attemptPhotoInput directly.
+    if (rateInfo && rateInfo.tier !== 'plus' && rateInfo.tier !== 'pro') {
+      requireUpgrade('photo-input', { onTryFree: () => void attemptPhotoInput() });
+      return;
+    }
+    void attemptPhotoInput();
+  }
+
+  function onCustomTextareaPaste(e: React.ClipboardEvent<HTMLTextAreaElement>) {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    for (const item of Array.from(items)) {
+      if (item.kind === 'file' && item.type.startsWith('image/')) {
+        const file = item.getAsFile();
+        if (file) {
+          e.preventDefault();
+          void handleImageFile(file);
+          return;
+        }
+      }
+    }
+  }
+
+  async function submitCustomProblem() {
+    const trimmed = customProblem.trim();
+    if (!trimmed) return;
+    // Already classifying — bail to avoid duplicate in-flight requests.
+    if (classifying) return;
+
+    const isProblem = looksLikeProblem(trimmed);
+    setSubmitHint(null);
+
+    // Abort any previous classify in case it's still pending.
+    classifyAbortRef.current?.abort();
+    const controller = new AbortController();
+    classifyAbortRef.current = controller;
+
+    setClassifying(true);
+    let match: Awaited<ReturnType<typeof classifyTopic>> = null;
+    try {
+      match = await classifyTopic({ problem: trimmed, getToken, signal: controller.signal });
+    } catch (err) {
+      // Aborted: a newer submit superseded this one; drop the result silently.
+      if (err instanceof Error && err.name === 'AbortError') return;
+      // Never got an answer — say why, rather than telling the student to
+      // rephrase a problem that was never read.
+      if (err instanceof ClassifyError) {
+        setSubmitHint(err.message);
+        return;
+      }
+      // Anything else is non-fatal; treat as no-match.
+    } finally {
+      // Only the controller that actually finished should clear the ref.
+      if (classifyAbortRef.current === controller) classifyAbortRef.current = null;
+      setClassifying(false);
+    }
+
+    // Cross-course / cross-topic match → navigate.
+    if (
+      match &&
+      (match.courseId !== course!.id || match.topicId !== topic!.id)
+    ) {
+      onNavigate({
+        name: 'topic',
+        courseId: match.courseId,
+        topicId: match.topicId,
+        problem: isProblem ? trimmed : undefined,
+      });
+      return;
+    }
+
+    // No usable match (or matched this same topic).
+    // If the input looks like a real problem and matched this topic, run it.
+    if (isProblem && match) {
+      scrollToTop();
+      void runWalkthrough(trimmed);
+      return;
+    }
+
+    // Couldn't place the input — surface a message instead of silently clearing.
+    setSubmitHint(
+      isProblem
+        ? "Couldn't quite place that one — try adding more context, or open one of the topics below."
+        : "Couldn't quite place that one — be more specific. Try a full problem like “factor x² + 5x + 6” or “find dy/dx for y = sin(x²)”.",
+    );
+  }
+
+  const otherTopics = course.topics.filter((t) => t.id !== topic.id).slice(0, 4);
+  const hasOutput =
+    parsed.preamble !== null ||
+    parsed.complete.length > 0 ||
+    parsed.streamingTail !== null;
+  // A practice run that never produced a statement. "Writing…" is only true
+  // while it is actually being written — once the run has ended the card has
+  // to say why, or it sits there claiming to work while the limit notice
+  // renders underneath it.
+  const practiceNotice =
+    limitStatus === 'rate-limited'
+      ? 'Out of practice problems for today'
+      : limitStatus === 'sign-in-required'
+        ? 'Sign in to keep going'
+        : limitStatus === 'error'
+          ? "Couldn't write a problem"
+          : inventing
+            ? 'Writing a fresh problem…'
+            : 'Stopped before a problem arrived';
+  const isStreamingWalkthrough = streaming === 'walkthrough';
+  const isStreamingAnything = streaming !== null || inventing;
+
+  // Everything the clear button undoes. When all of it is already true the
+  // page *is* the default, so the control would be a no-op.
+  const isDefaultState =
+    focus.kind === 'example' && !hasOutput && !limitStatus && !isStreamingAnything;
+  // The generate row stays up while a practice problem is only being looked at,
+  // so the student can walk it through, re-roll it, or change the difficulty.
+  const canStartRun = !hasOutput && !limitStatus && !isStreamingAnything;
+
+  // In step mode, only show segments up to revealCount.
+  const visibleSteps =
+    sessionMode === 'all'
+      ? parsed.complete
+      : parsed.complete.slice(0, revealCount);
+
+  const isPaid = rateInfo?.tier === 'plus' || rateInfo?.tier === 'pro';
+
+  // Stable callback for StepCard memoization. Reads dynamic state through a
+  // ref so the callback identity doesn't change as whyHow / isPaid update —
+  // only the step whose text or whyHowText actually changes will re-render.
+  const toggleCtxRef = useRef({ isPaid, whyHow, requireUpgrade, requestWhyHow });
+  toggleCtxRef.current = { isPaid, whyHow, requireUpgrade, requestWhyHow };
+  const handleToggleWhyHow = useCallback((i: number) => {
+    const c = toggleCtxRef.current;
+    if (!c.isPaid) {
+      c.requireUpgrade('why-how', { onTryFree: () => void c.requestWhyHow(i) });
+      return;
+    }
+    if (c.whyHow[i] !== undefined) {
+      setExpanded((p) => ({ ...p, [i]: !p[i] }));
+      return;
+    }
+    void c.requestWhyHow(i);
+  }, []);
+
+  const finalAnswered = useMemo(
+    () => streamDone && /\*\*Answer:\*\*/i.test(buffer),
+    [streamDone, buffer],
+  );
+
+  const canRevealMore =
+    sessionMode === 'step' && revealCount < parsed.complete.length;
+  const moreIncoming =
+    sessionMode === 'step' &&
+    revealCount === parsed.complete.length &&
+    !streamDone &&
+    isStreamingWalkthrough;
+  const walkthroughFinished =
+    streamDone &&
+    (sessionMode === 'all' || revealCount >= parsed.complete.length);
+
+  return (
+    <main
+      className="responsive-pad"
+      style={{
+        maxWidth: 720,
+        margin: '0 auto',
+        paddingTop: 24,
+        paddingBottom: 96,
+      }}
+    >
+      <button
+        onClick={() => onNavigate({ name: 'walkthrough', courseId: course.id })}
+        className="btn-press"
+        style={breadcrumb()}
+      >
+        ← {course.title}
+      </button>
+
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'flex-start',
+          justifyContent: 'space-between',
+          gap: 16,
+          margin: '0 0 16px',
+        }}
+      >
+        <h1
+          className="reveal reveal-1"
+          style={{
+            fontFamily: T.sans,
+            fontSize: 'clamp(28px, 6vw, 38px)',
+            fontWeight: 700,
+            lineHeight: 1.05,
+            letterSpacing: '-0.02em',
+            margin: 0,
+            color: T.ink,
+            flex: 1,
+          }}
+        >
+          {topic.title}
+        </h1>
+        <button
+          type="button"
+          onClick={() => toggleTopicBookmark(course.id, topic.id, userId)}
+          aria-label={bookmarked ? `Remove ${topic.title} from bookmarks` : `Bookmark ${topic.title}`}
+          aria-pressed={bookmarked}
+          title={bookmarked ? 'Topic is bookmarked' : 'Bookmark this topic'}
+          className="btn-press chamfer"
+          style={{
+            background: bookmarked ? T.paper2 : 'transparent',
+            border: `1px solid ${bookmarked ? T.ink : T.hair}`,
+            color: bookmarked ? T.accent : T.muted,
+            padding: '8px 12px',
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 6,
+            cursor: 'pointer',
+            fontSize: 12,
+            fontFamily: T.mono,
+            letterSpacing: '0.08em',
+            textTransform: 'uppercase',
+            flexShrink: 0,
+          }}
+        >
+          <BookmarkIcon size="16px" filled={bookmarked} />
+          <span>{bookmarked ? 'Saved' : 'Save'}</span>
+        </button>
+      </div>
+
+      <section
+        className="reveal reveal-2"
+        style={{
+          padding: '18px 20px',
+          border: `1px solid ${T.ink}`,
+          background: T.paper2,
+          marginBottom: 24,
+        }}
+      >
+        <div style={kicker()}>STRATEGIC ANCHOR</div>
+        <MathMarkdown
+          className="markdown-body"
+          style={{ fontSize: 15, lineHeight: 1.55 }}
+        >
+          {topic.strategicAnchor}
+        </MathMarkdown>
+      </section>
+
+      <section className="reveal reveal-3" style={{ marginBottom: 20 }}>
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'baseline',
+            justifyContent: 'space-between',
+            gap: 12,
+          }}
+        >
+          <div style={kicker(8)}>{FOCUS_KICKER[focus.kind]}</div>
+          {!isDefaultState && (
+            <button
+              type="button"
+              onClick={clearWalkthrough}
+              className="btn-press"
+              aria-label="Clear this walkthrough and go back to the example problem"
+              style={{
+                background: 'transparent',
+                border: 'none',
+                // Same trick as the stop button: the hit area grows to 44px
+                // while the negative margin keeps the row where it was.
+                padding: '12px 6px',
+                margin: '-12px -6px',
+                minHeight: 44,
+                display: 'inline-flex',
+                alignItems: 'center',
+                fontFamily: T.mono,
+                fontSize: 12,
+                color: T.muted,
+                cursor: 'pointer',
+                textDecoration: 'underline',
+                whiteSpace: 'nowrap',
+              }}
+            >
+              clear walkthrough
+            </button>
+          )}
+        </div>
+        <div
+          style={{
+            border: `1px solid ${T.ink}`,
+            background: T.paper,
+            padding: '20px 22px',
+            fontSize: 18,
+            overflowX: 'auto',
+          }}
+        >
+          {focus.text === null ? (
+            <div
+              role="status"
+              aria-live="polite"
+              style={{ fontFamily: T.mono, fontSize: 14, color: T.muted }}
+            >
+              {practiceNotice}
+            </div>
+          ) : (
+            // One layer, always typeset. The decode permutes the glyphs of
+            // this very DOM, so there is no second representation and no
+            // moment where the font or size changes.
+            <div ref={problemRef} role="status" aria-live="polite">
+              <MathMarkdown className="markdown-body">{focus.text}</MathMarkdown>
+            </div>
+          )}
+        </div>
+      </section>
+
+      {/* The one model control on the page. It governs every run started from
+          here — the walkthrough, a practice problem, or a typed problem in the
+          section below — so it stays mounted even once output exists. */}
+      <div className="reveal reveal-4">
+        <ModelPicker
+          value={modelChoice}
+          onChange={setModelChoice}
+          canChoose={canChooseModel}
+          ready={modelReady}
+          maxRemaining={maxRemaining}
+          onLocked={() => requireUpgrade('max-model')}
+          disabled={classifying || isStreamingAnything}
+        />
+      </div>
+
+      {canStartRun && (
+        <div className="reveal reveal-4">
+          <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
+          <button
+            onClick={() => {
+              scrollToTop();
+              // Whatever is in the card: an invented problem if one is sitting
+              // there, the topic's canonical example otherwise.
+              void runWalkthrough(practiceProblem ?? undefined, {
+                invented: practiceProblem !== null,
+              });
+            }}
+            className="btn-press chamfer"
+            style={primaryCta()}
+          >
+            Walk me through it →
+          </button>
+          <button
+            onClick={() => {
+              scrollToTop();
+              void runInvent();
+            }}
+            className="btn-press chamfer"
+            aria-label="Generate a fresh practice problem on this topic"
+            style={{
+              background: 'transparent',
+              color: T.ink,
+              border: `1px solid ${T.ink}`,
+              padding: '12px 20px',
+              fontSize: 15,
+              fontWeight: 500,
+              cursor: 'pointer',
+              fontFamily: T.sans,
+            }}
+          >
+            Try one like this →
+          </button>
+          </div>
+          <DifficultyPicker
+            value={practiceDifficulty}
+            onChange={setPracticeDifficulty}
+          />
+        </div>
+      )}
+
+      {isStreamingAnything && (
+        <div
+          role="status"
+          aria-live="polite"
+          style={{
+            marginBottom: 12,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 12,
+            flexWrap: 'wrap',
+          }}
+        >
+          <span style={kicker(0)}>
+            {inventing
+              ? 'WRITING A PROBLEM…'
+              : isStreamingWalkthrough
+                ? 'IRIS IS STREAMING…'
+                : 'WHY & HOW STREAMING…'}
+          </span>
+          <button
+            onClick={() => {
+              walkthroughAbortRef.current?.abort();
+              whyHowAbortRef.current?.abort();
+              inventAbortRef.current?.abort();
+              bufferBatcher.cancel();
+              whyHowStreamBatcher.cancel();
+              setStreaming(null);
+              setWhyHowStream(null);
+              setInventing(false);
+            }}
+            className="btn-press"
+            style={{
+              background: 'transparent',
+              border: 'none',
+              padding: '12px 10px',
+              margin: '-12px -10px',
+              minHeight: 44,
+              display: 'inline-flex',
+              alignItems: 'center',
+              fontSize: 12,
+              color: T.muted,
+              cursor: 'pointer',
+              textDecoration: 'underline',
+            }}
+          >
+            stop
+          </button>
+        </div>
+      )}
+
+      {rateInfo && (hasOutput || isStreamingAnything) && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
+          <UsagePill rate={rateInfo} signedIn={!!isSignedIn} />
+          {rateInfo.modelUsed && (
+            <span
+              style={{
+                fontFamily: T.mono,
+                fontSize: 11,
+                letterSpacing: '0.12em',
+                textTransform: 'uppercase',
+                color: T.muted,
+              }}
+            >
+              · {modelLabel(rateInfo.modelUsed)}
+            </span>
+          )}
+          {rateInfo.simulated && (
+            <span
+              title="Generated using local mathematical verified mock in development mode"
+              style={{
+                fontFamily: T.mono,
+                fontSize: 10,
+                letterSpacing: '0.08em',
+                textTransform: 'uppercase',
+                padding: '2px 8px',
+                border: `1px solid ${T.hair}`,
+                background: T.paper2,
+                color: T.muted,
+              }}
+            >
+              SIMULATED DEV AI
+            </span>
+          )}
+        </div>
+      )}
+
+
+      {/* Only when the user *wanted* Max and couldn't have it. Choosing
+          Standard yourself is not a downgrade and gets no notice. */}
+      {rateInfo?.degraded &&
+        rateInfo.downgradeReason !== 'user' &&
+        (hasOutput || isStreamingAnything) && (
+          <div
+            style={{
+              border: `1px solid ${T.ink}`,
+              background: T.paper2,
+              padding: '12px 16px',
+              marginBottom: 12,
+              fontSize: 14,
+              lineHeight: 1.5,
+            }}
+          >
+            {rateInfo.downgradeReason === 'monthly' ? (
+              <>
+                <strong>You've used this month's Max walkthroughs.</strong> Back on
+                Sonnet 4.6 until your monthly allowance resets.
+              </>
+            ) : (
+              <>
+                <strong>
+                  You've used your {rateInfo.premiumAllotment ?? 5} Max walkthroughs today.
+                </strong>{' '}
+                Now on Sonnet 4.6 for the rest of today — still strong, just not the top
+                of the stack.
+              </>
+            )}
+          </div>
+        )}
+
+      {limitStatus === 'sign-in-required' && (
+        <div style={errorBox()}>
+          <div style={kicker()}>FREE WALKTHROUGH USED</div>
+          <p style={{ margin: '6px 0 12px', fontSize: 14, lineHeight: 1.5 }}>
+            {limitDetail?.message ??
+              "You've used your free walkthroughs today. Sign in for 5/day."}
+          </p>
+          <SignInButton mode="modal">
+            <button className="btn-press chamfer" style={primaryCta()}>
+              Sign in to continue
+            </button>
+          </SignInButton>
+        </div>
+      )}
+
+      {limitStatus === 'rate-limited' && (
+        <div style={errorBox()}>
+          <div style={kicker()}>DAILY LIMIT REACHED</div>
+          <p style={{ margin: '6px 0 12px', fontSize: 14, lineHeight: 1.5 }}>
+            {limitDetail?.message ?? "You've used today's walkthroughs."}{' '}
+            {limitDetail?.resetAt && (
+              <span style={{ color: T.muted }}>
+                Resets {formatReset(limitDetail.resetAt)}.
+              </span>
+            )}
+          </p>
+          {!isPaid && (
+            <button
+              type="button"
+              onClick={() => requireUpgrade('walkthrough-quota')}
+              className="btn-press chamfer"
+              style={cta()}
+            >
+              See Plus + Pro plans →
+            </button>
+          )}
+        </div>
+      )}
+
+      {limitStatus === 'error' && errorMsg && (
+        <div style={errorBox()}>
+          <div style={kicker()}>SOMETHING WENT WRONG</div>
+          <p
+            style={{
+              margin: '6px 0 12px',
+              fontSize: 14,
+              lineHeight: 1.5,
+              fontFamily: T.mono,
+            }}
+          >
+            {errorMsg}
+          </p>
+          <button
+            onClick={() =>
+              sessionPractice && practiceProblem === null
+                ? runInvent()
+                : runWalkthrough(problemForSession, { invented: sessionPractice })
+            }
+            className="btn-press chamfer"
+            style={cta()}
+          >
+            Try again
+          </button>
+        </div>
+      )}
+
+      {visibleSteps.map((stepText, i) => (
+        <StepCard
+          key={i}
+          index={i}
+          text={stepText}
+          whyHowText={whyHow[i]}
+          whyHowExpanded={!!expanded[i]}
+          whyHowStreaming={whyHowStream?.index === i ? whyHowStream.text : null}
+          onToggleWhyHow={handleToggleWhyHow}
+          disabledWhyHow={isStreamingAnything}
+        />
+      ))}
+
+      {/* In 'all' mode, show the streaming tail inline as it arrives. */}
+      {sessionMode === 'all' && parsed.streamingTail && (
+        <MathMarkdown
+          className="markdown-body"
+          style={{
+            marginTop: 16,
+            padding: '20px 22px',
+            border: `1px solid ${T.ink}`,
+            background: T.paper,
+            fontSize: 15,
+            lineHeight: 1.6,
+          }}
+        >
+          {parsed.streamingTail}
+        </MathMarkdown>
+      )}
+
+      {canRevealMore && (
+        <button
+          onClick={() => setRevealCount((n) => n + 1)}
+          className="btn-press chamfer"
+          style={{ ...primaryCta(), marginTop: 16 }}
+        >
+          Next step →
+        </button>
+      )}
+
+      {moreIncoming && (
+        <div
+          role="status"
+          aria-live="polite"
+          style={{
+            marginTop: 16,
+            fontSize: 13,
+            color: T.muted,
+            fontFamily: T.mono,
+            letterSpacing: '0.1em',
+            textTransform: 'uppercase',
+          }}
+        >
+          … preparing next step
+        </div>
+      )}
+
+      {isStreamingWalkthrough && !streamDone && !moreIncoming && visibleSteps.length > 0 && (
+        <div
+          role="status"
+          aria-live="polite"
+          style={{
+            marginTop: 16,
+            fontSize: 13,
+            color: T.muted,
+            fontFamily: T.mono,
+            letterSpacing: '0.1em',
+            textTransform: 'uppercase',
+          }}
+        >
+          … iris is still writing
+        </div>
+      )}
+
+      {walkthroughFinished && (
+        <div
+          style={{
+            marginTop: 16,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            flexWrap: 'wrap',
+            gap: 12,
+          }}
+        >
+          <div
+            role="status"
+            aria-live="polite"
+            style={{
+              fontSize: 12,
+              color: T.muted,
+              fontFamily: T.mono,
+              letterSpacing: '0.12em',
+              textTransform: 'uppercase',
+            }}
+          >
+            {finalAnswered
+              ? 'Walkthrough complete'
+              : parsed.complete.length === 1
+                ? 'No further steps were generated'
+                : 'Walkthrough finished'}
+          </div>
+          {buffer && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <button
+                type="button"
+                onClick={() => void runWalkthrough(problemForSession)}
+                disabled={isStreamingWalkthrough}
+                className="btn-press"
+                aria-label="Retry mathematical solution"
+                style={{
+                  background: 'transparent',
+                  border: `1px solid ${T.hair}`,
+                  color: T.ink,
+                  padding: '5px 12px',
+                  fontSize: 11,
+                  fontFamily: T.mono,
+                  letterSpacing: '0.08em',
+                  textTransform: 'uppercase',
+                  cursor: isStreamingWalkthrough ? 'not-allowed' : 'pointer',
+                  opacity: isStreamingWalkthrough ? 0.6 : 1,
+                }}
+              >
+                ↺ Retry Solution
+              </button>
+              <button
+                type="button"
+                onClick={async () => {
+                  try {
+                    await navigator.clipboard.writeText(buffer);
+                    setCopiedSolution(true);
+                    setTimeout(() => setCopiedSolution(false), 2000);
+                  } catch {
+                    // Fallback if clipboard API is restricted
+                  }
+                }}
+                className="btn-press"
+                aria-label="Copy solution markdown"
+                style={{
+                  background: 'transparent',
+                  border: `1px solid ${T.hair}`,
+                  color: T.ink,
+                  padding: '5px 12px',
+                  fontSize: 11,
+                  fontFamily: T.mono,
+                  letterSpacing: '0.08em',
+                  textTransform: 'uppercase',
+                  cursor: 'pointer',
+                }}
+              >
+                {copiedSolution ? '✓ Copied LaTeX' : 'Copy Solution'}
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
+
+      {verifyState !== 'idle' && (
+        <div
+          role="status"
+          aria-live="polite"
+          style={{
+            marginTop: 10,
+            padding: verifyState === 'incorrect' ? '8px 12px' : 0,
+            border: verifyState === 'incorrect' ? `1px solid ${T.ink}` : 'none',
+            background: verifyState === 'incorrect' ? T.paper2 : 'transparent',
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 8,
+            fontFamily: T.mono,
+            fontSize: 11,
+            letterSpacing: '0.12em',
+            textTransform: 'uppercase',
+            color:
+              verifyState === 'correct' ? T.accent :
+              verifyState === 'incorrect' ? T.ink :
+              T.muted,
+          }}
+        >
+          <span aria-hidden style={{ fontSize: 13, display: 'inline-flex', alignItems: 'center' }}>
+            {verifyState === 'verifying' ? '·' :
+             verifyState === 'correct'   ? <CheckIcon size="13px" /> :
+             verifyState === 'incorrect' ? '!' :
+             '?'}
+          </span>
+          {verifyState === 'verifying' ? 'Checking the answer…' :
+           verifyState === 'correct'   ? 'Answer verified' :
+           verifyState === 'incorrect' ? (verifyReason ? `Possible issue: ${verifyReason}` : 'Possible issue — double-check this') :
+           'Couldn’t verify automatically'}
+        </div>
+      )}
+
+      {verifyState === 'incorrect' && rateInfo && !isPaid && (
+        <div
+          style={{
+            marginTop: 8,
+            padding: '8px 12px',
+            border: `1px solid ${T.hair}`,
+            background: 'transparent',
+            fontFamily: T.mono,
+            fontSize: 11,
+            letterSpacing: '0.1em',
+            lineHeight: 1.5,
+            color: T.muted,
+          }}
+        >
+          MathIQ+ runs Opus 4.6 and Sonnet 4.6 — far fewer errors on problems like this.{' '}
+          <button
+            type="button"
+            onClick={() => onNavigate({ name: 'settings' })}
+            className="btn-press"
+            style={{
+              background: 'transparent',
+              border: 'none',
+              padding: '12px 4px',
+              margin: '-12px -4px',
+              minHeight: 44,
+              display: 'inline-flex',
+              alignItems: 'center',
+              fontFamily: T.mono,
+              fontSize: 11,
+              letterSpacing: '0.1em',
+              color: T.accent,
+              textDecoration: 'underline',
+              cursor: 'pointer',
+            }}
+          >
+            Upgrade →
+          </button>
+        </div>
+      )}
+
+      {/* The moment the budget exists for: this answer wasn't good enough, so
+          spend a Max slot on it. Also the only way to reach Max on a
+          walkthrough auto-started from the landing page. */}
+      {walkthroughFinished &&
+        sessionModel === 'standard' &&
+        canChooseModel &&
+        maxRemaining !== undefined &&
+        maxRemaining > 0 && (
+          <div style={{ marginTop: 12 }}>
+            <button
+              type="button"
+              onClick={() =>
+                void runWalkthrough(problemForSession, {
+                  model: 'max',
+                  invented: sessionPractice,
+                })
+              }
+              className="btn-press chamfer"
+              style={{
+                background: 'transparent',
+                color: T.ink,
+                border: `1px solid ${T.ink}`,
+                padding: '10px 18px',
+                minHeight: 44,
+                fontSize: 14,
+                fontWeight: 500,
+                cursor: 'pointer',
+                fontFamily: T.sans,
+              }}
+            >
+              Redo on Max →
+            </button>
+            <div
+              style={{
+                marginTop: 6,
+                fontSize: 12,
+                color: T.muted,
+                lineHeight: 1.4,
+              }}
+            >
+              Runs this problem again on Opus 4.6. {maxRemaining} left today.
+            </div>
+          </div>
+        )}
+
+      {saveState !== 'idle' && (
+        <div
+          role="status"
+          aria-live="polite"
+          style={{
+            marginTop: 6,
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 6,
+            fontFamily: T.mono,
+            fontSize: 11,
+            letterSpacing: '0.12em',
+            textTransform: 'uppercase',
+            color: saveState === 'failed' ? T.ink : T.muted,
+            marginLeft: verifyState !== 'idle' ? 12 : 0,
+          }}
+        >
+          <span aria-hidden style={{ fontSize: 13, display: 'inline-flex', alignItems: 'center' }}>
+            {saveState === 'saving' ? '·' : saveState === 'saved' ? <CheckIcon size="13px" /> : '!'}
+          </span>
+          {saveState === 'saving' ? 'Saving to history…' :
+           saveState === 'saved'  ? 'Saved to history' :
+           'History save failed'}
+        </div>
+      )}
+
+      <hr
+        style={{
+          margin: '40px 0 24px',
+          border: 'none',
+          borderTop: `1px solid ${T.hair}`,
+        }}
+      />
+
+      <section>
+        <div style={kicker(8)}>TRY YOUR OWN PROBLEM</div>
+        <textarea
+          value={customProblem}
+          onChange={(e) => {
+            setCustomProblem(e.target.value);
+            if (submitHint) setSubmitHint(null);
+          }}
+          onPaste={onCustomTextareaPaste}
+          aria-label="Type your own problem"
+          placeholder={`Paste a ${topic.title.toLowerCase()} problem (or anything from ${course.title} — Iris will route).`}
+          rows={3}
+          style={{
+            width: '100%',
+            border: `1px solid ${T.ink}`,
+            background: T.paper,
+            padding: '12px 14px',
+            fontSize: 15,
+            fontFamily: T.mono,
+            resize: 'vertical',
+            color: T.ink,
+          }}
+        />
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 12,
+            marginTop: 12,
+            flexWrap: 'wrap',
+          }}
+        >
+          <button
+            onClick={submitCustomProblem}
+            disabled={!customProblem.trim() || classifying || isStreamingAnything}
+            className="btn-press chamfer"
+            style={primaryCta(
+              !customProblem.trim() || classifying || isStreamingAnything,
+            )}
+          >
+            {classifying ? 'Routing…' : 'Generate →'}
+          </button>
+          <button
+            type="button"
+            onClick={() => void onImageButtonClick()}
+            disabled={ocrState === 'reading' || classifying || isStreamingAnything}
+            aria-label="Scan a problem with your camera"
+            className="btn-press"
+            style={{
+              background: 'transparent',
+              border: `1px solid ${T.ink}`,
+              padding: '10px 14px',
+              fontSize: 13,
+              fontWeight: 500,
+              cursor: ocrState === 'reading' || classifying || isStreamingAnything ? 'not-allowed' : 'pointer',
+              fontFamily: T.mono,
+              letterSpacing: '0.08em',
+              color: T.ink,
+            }}
+          >
+            {ocrState === 'reading' ? 'Reading…' : 'Scan'}
+          </button>
+          <span style={{ fontSize: 12, color: T.muted, lineHeight: 1.4 }}>
+            If your problem fits a different topic, Iris will route you there.
+          </span>
+        </div>
+        {ocrState === 'error' && ocrMessage && (
+          <div
+            role="status"
+            aria-live="polite"
+            style={{
+              marginTop: 12,
+              fontSize: 13,
+              color: T.muted,
+              fontFamily: T.mono,
+            }}
+          >
+            {ocrMessage}
+          </div>
+        )}
+        {submitHint && (
+          <div
+            role="status"
+            aria-live="polite"
+            style={{
+              marginTop: 12,
+              padding: '10px 14px',
+              border: `1px solid ${T.ink}`,
+              background: T.paper2,
+              fontSize: 13,
+              lineHeight: 1.5,
+              color: T.ink,
+            }}
+          >
+            {submitHint}
+          </div>
+        )}
+      </section>
+
+      {otherTopics.length > 0 && (
+        <section style={{ marginTop: 48 }}>
+          <div style={kicker(10)}>OTHER TOPICS IN {course.title.toUpperCase()}</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {otherTopics.map((t) => (
+              <button
+                key={t.id}
+                aria-label={`Open ${t.title}`}
+                onClick={() =>
+                  onNavigate({ name: 'topic', courseId: course.id, topicId: t.id })
+                }
+                className="btn-press"
+                style={{
+                  background: 'transparent',
+                  border: `1px solid ${T.hair}`,
+                  padding: '14px 16px',
+                  textAlign: 'left',
+                  cursor: 'pointer',
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  fontFamily: 'inherit',
+                  color: T.ink,
+                }}
+              >
+                <span style={{ minWidth: 0 }}>
+                  <span style={{ fontWeight: 700, fontSize: 15 }}>{t.title}</span>
+                  <MathMarkdown
+                    as="span"
+                    className="markdown-body"
+                    style={{
+                      fontSize: 13,
+                      color: T.muted,
+                      marginLeft: 8,
+                      display: 'inline',
+                    }}
+                    components={INLINE_COMPONENTS}
+                  >
+                    {t.blurb}
+                  </MathMarkdown>
+                </span>
+                <span className="arrow-nudge" style={{ color: T.muted }}>
+                  →
+                </span>
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
+    </main>
+  );
+}
+
+interface StepCardProps {
+  index: number;
+  text: string;
+  whyHowText: string | undefined;
+  whyHowExpanded: boolean;
+  whyHowStreaming: string | null;
+  onToggleWhyHow: (index: number) => void;
+  disabledWhyHow: boolean;
+}
+
+const STEP_CARD_STYLE: React.CSSProperties = {
+  marginTop: 16,
+  border: `1px solid ${T.ink}`,
+  background: T.paper,
+};
+
+const STEP_BODY_STYLE: React.CSSProperties = {
+  padding: '20px 22px',
+  fontSize: 15,
+  lineHeight: 1.6,
+};
+
+// No vertical padding: the button inside carries the row's 44px height, so
+// the whole strip is the tap target rather than a 14px line in the middle.
+const STEP_TOGGLE_ROW_STYLE: React.CSSProperties = {
+  borderTop: `1px solid ${T.hair}`,
+  padding: '0 16px',
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'space-between',
+  gap: 12,
+};
+
+const STEP_WHY_HOW_STYLE: React.CSSProperties = {
+  borderTop: `1px solid ${T.hair}`,
+  padding: '16px 22px',
+  background: T.paper2,
+  fontSize: 14,
+  lineHeight: 1.55,
+};
+
+const StepCard = memo(function StepCard({
+  index,
+  text,
+  whyHowText,
+  whyHowExpanded,
+  whyHowStreaming,
+  onToggleWhyHow,
+  disabledWhyHow,
+}: StepCardProps) {
+  const liveStreaming = whyHowStreaming !== null;
+  const showWhyHowBlock =
+    liveStreaming || (whyHowExpanded && whyHowText !== undefined);
+  const buttonDisabled = disabledWhyHow && !liveStreaming;
+  return (
+    <article style={STEP_CARD_STYLE}>
+      <MathMarkdown className="markdown-body" style={STEP_BODY_STYLE}>
+        {text}
+      </MathMarkdown>
+      <div style={STEP_TOGGLE_ROW_STYLE}>
+        <button
+          onClick={() => onToggleWhyHow(index)}
+          disabled={buttonDisabled}
+          className="btn-press"
+          style={{
+            background: 'transparent',
+            border: 'none',
+            padding: 0,
+            minHeight: 44,
+            display: 'inline-flex',
+            alignItems: 'center',
+            fontSize: 12,
+            fontFamily: T.mono,
+            letterSpacing: '0.12em',
+            textTransform: 'uppercase',
+            color: buttonDisabled ? T.hairStrong : T.accent,
+            cursor: buttonDisabled ? 'not-allowed' : 'pointer',
+            textDecoration: 'underline',
+          }}
+          aria-expanded={showWhyHowBlock}
+          aria-controls={`why-how-${index}`}
+        >
+          {whyHowText !== undefined
+            ? whyHowExpanded
+              ? 'Hide why & how'
+              : 'Show why & how'
+            : 'Why & how?'}
+        </button>
+      </div>
+      {showWhyHowBlock && (
+        <MathMarkdown
+          id={`why-how-${index}`}
+          className="markdown-body"
+          style={STEP_WHY_HOW_STYLE}
+        >
+          {liveStreaming ? whyHowStreaming! : whyHowText!}
+        </MathMarkdown>
+      )}
+    </article>
+  );
+});
+
+function UsagePill({
+  rate,
+  signedIn,
+}: {
+  rate: RateLimitInfo;
+  signedIn: boolean;
+}) {
+  const used = rate.limit - rate.remaining;
+  const label = signedIn
+    ? `${used} of ${rate.limit} today`
+    : `${used} of ${rate.limit} free`;
+  return (
+    <div
+      style={{
+        display: 'inline-block',
+        padding: '4px 10px 5px',
+        background: 'transparent',
+        border: `1px solid ${T.hairStrong}`,
+        fontFamily: T.mono,
+        fontSize: 11,
+        letterSpacing: '0.12em',
+        textTransform: 'uppercase',
+        color: T.muted,
+        marginBottom: 12,
+      }}
+    >
+      {label}
+    </div>
+  );
+}
+
+/** Everything on the error card has to be a sentence the student can act
+ *  on. fetch() rejects with a bare "Failed to fetch" for anything from
+ *  airplane mode to a blocked request; WalkthroughError already carries copy. */
+function humanError(err: unknown): string {
+  if (err instanceof WalkthroughError) return err.message;
+  if (err instanceof TypeError) {
+    return "Couldn't reach MathIQ. Check your connection and try again.";
+  }
+  return 'Something went wrong. Try again in a moment.';
+}
+
+function modelLabel(id: string): string {
+  if (id === 'claude-opus-4-6') return 'OPUS 4.6';
+  if (id === 'claude-sonnet-4-6') return 'SONNET 4.6';
+  if (id === 'claude-haiku-4-5') return 'HAIKU 4.5';
+  if (id === 'deepseek/deepseek-chat') return 'DEEPSEEK V3';
+  return id.toUpperCase();
+}
+
+function formatReset(iso: string): string {
+  try {
+    const reset = new Date(iso);
+    const now = new Date();
+    const ms = reset.getTime() - now.getTime();
+    if (ms <= 0) return 'soon';
+    const hours = Math.floor(ms / 3_600_000);
+    const minutes = Math.floor((ms % 3_600_000) / 60_000);
+    if (hours > 0) return `in ${hours}h ${minutes}m`;
+    return `in ${minutes}m`;
+  } catch {
+    return 'soon';
+  }
+}
+
+function cta(): React.CSSProperties {
+  return {
+    background: T.ink,
+    color: T.paper,
+    border: 'none',
+    padding: '10px 18px',
+    fontSize: 14,
+    fontWeight: 500,
+    cursor: 'pointer',
+    fontFamily: T.sans,
+  };
+}
+
+function primaryCta(disabled = false): React.CSSProperties {
+  return {
+    background: disabled ? T.hair : T.accent,
+    color: disabled ? T.muted : T.paper,
+    border: 'none',
+    padding: '12px 20px',
+    fontSize: 15,
+    fontWeight: 500,
+    cursor: disabled ? 'not-allowed' : 'pointer',
+    fontFamily: T.sans,
+  };
+}
+
+function errorBox(): React.CSSProperties {
+  return {
+    border: `1px solid ${T.ink}`,
+    background: T.paper2,
+    padding: '16px 18px',
+    marginTop: 12,
+  };
+}

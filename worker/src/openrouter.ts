@@ -1,0 +1,206 @@
+/**
+ * OpenRouter streaming helper. Uses OpenAI-compatible chat-completions API.
+ * Same plain-text output shape as the Anthropic helper.
+ */
+import type { Course, Topic } from './courses';
+import {
+  buildSystemPromptFlat,
+  inventPrompt,
+  practicePrompt,
+  type IrisPrompts,
+  type PracticeDifficulty,
+} from './prompt';
+
+const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
+
+export type WalkthroughAction =
+  | 'walkthrough'
+  | 'why-how'
+  | 'practice'
+  | 'invent';
+
+export interface OpenRouterCallParams {
+  apiKey: string;
+  /** OpenRouter model id, e.g. "deepseek/deepseek-chat". */
+  model: string;
+  prompts: IrisPrompts;
+  course: Course;
+  topic: Topic;
+  problem?: string;
+  maxTokens?: number;
+  /** Optional — for OpenRouter analytics. */
+  appUrl?: string;
+  appName?: string;
+  action?: WalkthroughAction;
+  walkthroughSoFar?: string;
+  /** For action='practice' and action='invent': how hard the invented problem
+   *  should be. Ignored for every other action. */
+  difficulty?: PracticeDifficulty;
+  /** When the client disconnects mid-stream, this signal aborts both the
+   *  initial POST and the in-flight body read so the upstream stops
+   *  generating (and billing) tokens nobody will see. */
+  signal?: AbortSignal;
+}
+
+export interface OpenRouterCallResult {
+  ok: boolean;
+  status: number;
+  body: ReadableStream<Uint8Array> | null;
+  detail?: string;
+  isMock?: boolean;
+}
+
+export async function callOpenRouterStream(
+  params: OpenRouterCallParams,
+): Promise<OpenRouterCallResult> {
+  const {
+    apiKey,
+    model,
+    prompts,
+    course,
+    topic,
+    problem,
+    appUrl,
+    appName = 'MathIQ',
+    action = 'walkthrough',
+    walkthroughSoFar,
+    difficulty = 'standard',
+    signal,
+  } = params;
+  // why-how is bounded by the prompt at "2-4 short paragraphs" (~1-1.5K
+  // tokens). Capping at 2048 leaves headroom without paying for 8K of slack
+  // the model can't fill anyway.
+  const maxTokens =
+    params.maxTokens ??
+    (action === 'invent' ? 512 : action === 'why-how' ? 2048 : 8192);
+
+  const systemPrompt = buildSystemPromptFlat(prompts, course, topic);
+
+  const problemText = problem?.trim() || topic.exampleProblem;
+  const initialUserText = problem
+    ? `Walk me through this ${course.title.toLowerCase()} problem step by step:\n\n${problemText}`
+    : `Walk me through the canonical example for ${topic.title} step by step:\n\n${problemText}`;
+
+  const conversation = buildConversation(
+    prompts,
+    initialUserText,
+    action,
+    walkthroughSoFar,
+    difficulty,
+  );
+
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${apiKey}`,
+    'content-type': 'application/json',
+  };
+  if (appUrl) headers['HTTP-Referer'] = appUrl;
+  if (appName) headers['X-Title'] = appName;
+
+  const resp = await fetch(OPENROUTER_URL, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      model,
+      max_tokens: maxTokens,
+      stream: true,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        ...conversation,
+      ],
+    }),
+    signal,
+  });
+
+  if (!resp.ok || !resp.body) {
+    const detail = await resp.text().catch(() => '');
+    return {
+      ok: false,
+      status: resp.status,
+      body: null,
+      detail: detail.slice(0, 500),
+    };
+  }
+
+  return {
+    ok: true,
+    status: resp.status,
+    body: transformOpenAiSse(resp.body),
+  };
+}
+
+function buildConversation(
+  prompts: IrisPrompts,
+  initialUserText: string,
+  action: WalkthroughAction,
+  walkthroughSoFar: string | undefined,
+  difficulty: PracticeDifficulty,
+): Array<{ role: 'user' | 'assistant'; content: string }> {
+  if (action === 'why-how' && walkthroughSoFar?.trim()) {
+    return [
+      { role: 'user', content: initialUserText },
+      { role: 'assistant', content: walkthroughSoFar.trim() },
+      { role: 'user', content: prompts.whyHow },
+    ];
+  }
+  if (action === 'practice') {
+    return [{ role: 'user', content: practicePrompt(prompts, difficulty) }];
+  }
+  if (action === 'invent') {
+    return [{ role: 'user', content: inventPrompt(prompts, difficulty) }];
+  }
+  return [{ role: 'user', content: initialUserText }];
+}
+
+/**
+ * OpenAI-compatible SSE: each event is `data: {choices:[{delta:{content:"..."}}]}`.
+ */
+function transformOpenAiSse(
+  body: ReadableStream<Uint8Array>,
+): ReadableStream<Uint8Array> {
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+
+  return new ReadableStream<Uint8Array>({
+    async start(controller) {
+      reader = body.getReader();
+      let buffer = '';
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() ?? '';
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) continue;
+            const payload = line.slice(6).trim();
+            if (!payload || payload === '[DONE]') continue;
+            try {
+              const event = JSON.parse(payload);
+              const text: string | undefined = event.choices?.[0]?.delta?.content;
+              if (text) controller.enqueue(encoder.encode(text));
+            } catch {
+              // skip malformed event lines
+            }
+          }
+        }
+      } catch (err) {
+        controller.error(err);
+        return;
+      }
+      controller.close();
+    },
+    async cancel(reason) {
+      // Client disconnected mid-stream — stop reading from upstream so it
+      // stops generating (and billing) tokens nobody will see.
+      if (reader) {
+        try {
+          await reader.cancel(reason);
+        } catch {
+          // Reader may already be closed/errored — nothing more to do.
+        }
+      }
+    },
+  });
+}

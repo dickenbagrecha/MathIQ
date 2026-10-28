@@ -1,0 +1,97 @@
+name = "mathiq-api"
+main = "src/index.ts"
+compatibility_date = "2026-04-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Secrets (set via `wrangler secret put <NAME>`):
+#   ANTHROPIC_API_KEY
+#   CLERK_SECRET_KEY
+#   OPENROUTER_API_KEY
+#   STRIPE_SECRET_KEY
+#   STRIPE_WEBHOOK_SECRET
+#   RESEND_API_KEY        — for the daily streak reminder cron (skipped if unset)
+
+# Daily streak-reminder cron — 22:00 UTC every day. Picks up users with
+# active streaks who haven't completed today's daily challenge and sends a
+# one-click-unsubscribable reminder. See runStreakReminders in src/index.ts.
+[triggers]
+crons = ["0 22 * * *"]
+
+# KV namespace for subscription state + webhook idempotency.
+# Create with: `wrangler kv namespace create USAGE`
+# Then paste the returned `id` below.
+[[kv_namespaces]]
+binding = "USAGE"
+id = "a6fae18bec5c438d8f4ad82c8026b4cd"
+
+# Durable Object for atomic daily rate-limit counters. Each user/IP gets a
+# single-threaded actor so concurrent requests can't both bypass the ceiling.
+[[durable_objects.bindings]]
+name = "USAGE_DO"
+class_name = "UsageCounter"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["UsageCounter"]
+
+[vars]
+# Allowed origins for CORS and for Clerk's authorized parties. Comma-separated,
+# production only: the worker adds the Vite dev servers itself when it is
+# running under `wrangler dev`, never from this list.
+ALLOWED_ORIGINS = "https://mathiq.io,https://www.mathiq.io,https://math-iq.vercel.app"
+
+# Clerk publishable key — safe to commit (client-visible by design). Production
+# instance (clerk.mathiq.io); must belong to the same instance as the
+# CLERK_SECRET_KEY secret or every token fails.
+CLERK_PUBLISHABLE_KEY = "pk_live_Y2xlcmsubWF0aGlxLmlvJA"
+
+# Comma-separated Clerk user IDs (user_xxx...) granted MathIQ+ tier manually
+# (dev override / comp accounts). Stripe-paid subs are stored in KV via webhook.
+PRO_USER_IDS = ""
+
+# Comma-separated Clerk user IDs granted MathIQ Pro tier manually.
+# Set to empty string if no manual grants.
+MAX_USER_IDS = "user_3IyqrMvb7nojPF4mxaKOqEPA3oW"
+
+# Live Stripe price IDs — six SKUs (Monthly + Annual recurring, Semester
+# one-time, for both Plus and Pro). When prices are reshaped, move the
+# outgoing IDs into the `_OLD` slots below before pasting the new ones here.
+STRIPE_PRICE_PLUS_MONTHLY = "price_1TXDrnHJHOfcH2xmMhvhYKx9"
+STRIPE_PRICE_PLUS_ANNUAL  = "price_1TXDs8HJHOfcH2xmi2Bjh9X0"
+STRIPE_PRICE_PLUS_SEMESTER = "price_1TXDt5HJHOfcH2xmqfwfvHOL"
+STRIPE_PRICE_PRO_MONTHLY  = "price_1TXDqeHJHOfcH2xmi3ilzJoI"
+STRIPE_PRICE_PRO_ANNUAL   = "price_1TXDrMHJHOfcH2xmfI4b0Din"
+STRIPE_PRICE_PRO_SEMESTER = "price_1TXDthHJHOfcH2xmSa25pCcs"
+
+# Grandfathered (deactivated-in-Stripe) price IDs. Holds the IDs of every
+# previous price tier we've shipped — webhooks for existing subscribers
+# resolve to their tier here instead of silently downgrading them to free.
+# Leave empty when there are no grandfathered subscribers (e.g. dev).
+#
+# The six *_OLD slots below mirror the six live slots above, so every
+# previous SKU has a grandfathering home. If you do a third price reshape
+# in the future, add a second tier (`_OLD2`) and extend
+# `priceIdToTierInterval` in worker/src/stripe.ts to recognize it.
+STRIPE_PRICE_PLUS_MONTHLY_OLD  = "price_1TW78XHJHOfcH2xmkZFDsdtz"
+STRIPE_PRICE_PLUS_ANNUAL_OLD   = "price_1TX50oHJHOfcH2xmCrYGV8RP"
+STRIPE_PRICE_PLUS_SEMESTER_OLD = "price_1TX51ZHJHOfcH2xm5wCInQW8"
+STRIPE_PRICE_PRO_MONTHLY_OLD   = "price_1TX54pHJHOfcH2xmZXBafXCc"
+STRIPE_PRICE_PRO_ANNUAL_OLD    = "price_1TX55OHJHOfcH2xmd9uhWcVp"
+STRIPE_PRICE_PRO_SEMESTER_OLD  = "price_1TX55qHJHOfcH2xmPkffVYOu"
+
+# Where Stripe redirects after Checkout success/cancel and Portal exit.
+# Use your client origin + the Settings route.
+STRIPE_SUCCESS_URL       = "https://mathiq.io/?billing=success"
+STRIPE_CANCEL_URL        = "https://mathiq.io/?billing=cancelled"
+STRIPE_PORTAL_RETURN_URL = "https://mathiq.io/"
+
+# Streak reminder email — RESEND_API_KEY is set as a secret. REMINDER_FROM_EMAIL
+# must use a domain verified in Resend (DKIM + SPF DNS records in place).
+# Example: "MathIQ <streaks@mathiq.io>".
+REMINDER_FROM_EMAIL = "MathIQ <streaks@mathiq.io>"
+
+# Public origin used in email links (unsubscribe especially). Empty falls back
+# to the workers.dev URL, which is what a student would see in a reminder. The
+# rewrite in vercel.json proxies /api/email/unsubscribe here, so the link can be
+# a mathiq.io one — the two have to move together.
+WORKER_PUBLIC_URL = "https://mathiq.io"

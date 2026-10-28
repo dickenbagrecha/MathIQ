@@ -1,0 +1,302 @@
+/**
+ * Anthropic streaming helper. Calls /v1/messages with streaming on,
+ * returns a plain-text ReadableStream of the model's output.
+ */
+import type { Course, Topic } from './courses';
+import {
+  buildSystemPrompt,
+  inventPrompt,
+  practicePrompt,
+  type IrisPrompts,
+  type PracticeDifficulty,
+} from './prompt';
+
+const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
+
+/**
+ * Tail-end format reinforcement. Appended after the foundation + course/topic
+ * blocks — closest to the user message, where attention is highest. Smaller
+ * Claude models (Haiku) drift from the foundation's ending format and emit
+ * mangled markdown tables; the reinforcement reins them in without diluting
+ * the main prompt.
+ */
+const FORMAT_REINFORCEMENT = `Format reinforcement (priority — these override any drift):
+
+1. ENDING. After the final step, close with EXACTLY these two lines and nothing else:
+   **Answer:** <final answer, in LaTeX>
+   *Trigger to remember:* <1-3 sentence retrospective on the technique's trigger condition>
+
+   Do NOT write "Summary —", "Conclusion", "Final result", "What to remember", "Recap", or any other closing heading. The two lines above are the only permitted close. The literal token \`**Answer:**\` must appear — downstream verification depends on it.
+
+2. NO MARKDOWN TABLES. Pipe-delimited tables (\`| col | col |\`) routinely render as mangled inline text and must not appear. Choose the right alternative based on what the data is:
+
+   - **Numerical/symbolic matrices** (eigenvectors, linear transformations, augmented systems): use a LaTeX matrix wrapped in display-math delimiters. The \`$$\` wrappers are REQUIRED — matrix commands without them render as raw text. Example:
+     \`$$\\begin{bmatrix} 1 & 2 \\\\ 3 & 4 \\end{bmatrix}$$\`
+
+   - **Categorical or descriptive lists** (regions, cases, subdivisions, scenarios): use a markdown bullet list, NOT a matrix. Matrices are for math, not for "here are the four regions." Example:
+     \`- Region 1: $[0,1] \\times [0,1]$\`
+     \`- Region 2: $[0,1] \\times [1,2]$\``;
+
+export type WalkthroughAction =
+  | 'walkthrough'
+  | 'why-how'
+  | 'practice'
+  | 'invent';
+
+/** Token accounting from a single Anthropic call. Cache fields are 0 when
+ *  the call didn't touch the ephemeral cache. */
+export interface AnthropicUsage {
+  input_tokens: number;
+  cache_creation_input_tokens: number;
+  cache_read_input_tokens: number;
+  output_tokens: number;
+}
+
+export interface AnthropicCallParams {
+  apiKey: string;
+  model: 'claude-opus-4-6' | 'claude-sonnet-4-6' | 'claude-haiku-4-5';
+  prompts: IrisPrompts;
+  course: Course;
+  topic: Topic;
+  problem?: string;
+  maxTokens?: number;
+  action?: WalkthroughAction;
+  /** For action='why-how': the walkthrough text shown to the student so far,
+   *  ending with the step we want explained. */
+  walkthroughSoFar?: string;
+  /** For action='practice' and action='invent': how hard the invented problem
+   *  should be. Ignored for every other action. */
+  difficulty?: PracticeDifficulty;
+  /** When the client disconnects mid-stream, this signal aborts both the
+   *  initial POST and the in-flight body read so Anthropic stops generating
+   *  (and billing) tokens nobody will see. */
+  signal?: AbortSignal;
+  /** Called exactly once on natural stream completion with the final usage
+   *  block. Not called if the client disconnects mid-stream — partial usage
+   *  isn't billable info we want to record. */
+  onUsage?: (usage: AnthropicUsage) => Promise<void> | void;
+  /** Allow mock only if explicitly running in local dev mode. */
+  isDev?: boolean;
+}
+
+
+export interface AnthropicCallResult {
+  ok: boolean;
+  status: number;
+  /** Plain-text stream of the model's output. Null on error. */
+  body: ReadableStream<Uint8Array> | null;
+  /** Raw error detail (up to 500 chars). */
+  detail?: string;
+  /** Flag indicating mock response was used (strictly dev). */
+  isMock?: boolean;
+}
+
+export async function callAnthropicStream(
+  params: AnthropicCallParams,
+): Promise<AnthropicCallResult> {
+  const {
+    apiKey,
+    model,
+    prompts,
+    course,
+    topic,
+    problem,
+    action = 'walkthrough',
+    walkthroughSoFar,
+    difficulty = 'standard',
+    signal,
+    onUsage,
+    isDev = false,
+  } = params;
+
+  // Local development fallback: gated strictly on isDev being true AND key absent.
+  // In production, isDev is false, so a missing key properly triggers a 502/failure
+  // rather than pretending to generate AI responses.
+  if ((!apiKey || apiKey.trim() === '') && isDev) {
+    const { mockAnthropicCall } = await import('./mockProvider');
+    return { ...mockAnthropicCall(params), isMock: true };
+  }
+  // why-how is bounded by the prompt at "2-4 short paragraphs" (~1-1.5K
+  // tokens). Haiku (anonymous + free tiers) almost never fills more than
+  // 3-4K on a single walkthrough; capping at 4096 halves worst-case free
+  // COGS, and a truncation here is the natural moment to upgrade. Opus and
+  // Sonnet (paid) keep the full 8192 budget for dense walkthroughs.
+  const maxTokens =
+    params.maxTokens ??
+    (action === 'invent'
+      ? 512
+      : action === 'why-how'
+        ? 2048
+        : model === 'claude-haiku-4-5'
+          ? 4096
+          : 8192);
+
+  const problemText = problem?.trim() || topic.exampleProblem;
+  const initialUserText = problem
+    ? `Walk me through this ${course.title.toLowerCase()} problem step by step:\n\n${problemText}`
+    : `Walk me through the canonical example for ${topic.title} step by step:\n\n${problemText}`;
+
+  const messages = buildConversation(
+    prompts,
+    initialUserText,
+    action,
+    walkthroughSoFar,
+    difficulty,
+  );
+
+  const resp = await fetch(ANTHROPIC_URL, {
+    method: 'POST',
+    headers: {
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      model,
+      max_tokens: maxTokens,
+      // 'invent' skips the reinforcement on purpose: it mandates a closing
+      // `**Answer:**` line and declares itself priority-overriding, which is
+      // exactly the drift we don't want when the whole response is supposed to
+      // be an unsolved problem statement. The foundation block keeps its own
+      // cache_control either way, so the expensive prefix still hits.
+      system:
+        action === 'invent'
+          ? buildSystemPrompt(prompts, course, topic)
+          : [
+              ...buildSystemPrompt(prompts, course, topic),
+              {
+                type: 'text' as const,
+                text: FORMAT_REINFORCEMENT,
+                cache_control: { type: 'ephemeral' as const },
+              },
+            ],
+      messages,
+      stream: true,
+    }),
+    signal,
+  });
+
+  if (!resp.ok || !resp.body) {
+    const detail = await resp.text().catch(() => '');
+    return {
+      ok: false,
+      status: resp.status,
+      body: null,
+      detail: detail.slice(0, 500),
+    };
+  }
+
+  return {
+    ok: true,
+    status: resp.status,
+    body: transformAnthropicSse(resp.body, onUsage),
+  };
+}
+
+function buildConversation(
+  prompts: IrisPrompts,
+  initialUserText: string,
+  action: WalkthroughAction,
+  walkthroughSoFar: string | undefined,
+  difficulty: PracticeDifficulty,
+): Array<{ role: 'user' | 'assistant'; content: string }> {
+  if (action === 'why-how' && walkthroughSoFar?.trim()) {
+    return [
+      { role: 'user', content: initialUserText },
+      { role: 'assistant', content: walkthroughSoFar.trim() },
+      { role: 'user', content: prompts.whyHow },
+    ];
+  }
+  if (action === 'practice') {
+    return [{ role: 'user', content: practicePrompt(prompts, difficulty) }];
+  }
+  if (action === 'invent') {
+    return [{ role: 'user', content: inventPrompt(prompts, difficulty) }];
+  }
+  return [{ role: 'user', content: initialUserText }];
+}
+
+function transformAnthropicSse(
+  body: ReadableStream<Uint8Array>,
+  onUsage?: (usage: AnthropicUsage) => Promise<void> | void,
+): ReadableStream<Uint8Array> {
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+
+  return new ReadableStream<Uint8Array>({
+    async start(controller) {
+      reader = body.getReader();
+      let buffer = '';
+      // message_start carries input + cache token counts; message_delta
+      // carries the FINAL output_tokens. We accumulate both before invoking
+      // onUsage on natural close.
+      const usage: AnthropicUsage = {
+        input_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        output_tokens: 0,
+      };
+      let sawMessageDelta = false;
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() ?? '';
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) continue;
+            const payload = line.slice(6).trim();
+            if (!payload || payload === '[DONE]') continue;
+            try {
+              const event = JSON.parse(payload);
+              if (
+                event.type === 'content_block_delta' &&
+                event.delta?.type === 'text_delta'
+              ) {
+                const text = event.delta.text as string;
+                if (text) controller.enqueue(encoder.encode(text));
+              } else if (event.type === 'message_start' && event.message?.usage) {
+                const u = event.message.usage;
+                usage.input_tokens = u.input_tokens ?? 0;
+                usage.cache_creation_input_tokens = u.cache_creation_input_tokens ?? 0;
+                usage.cache_read_input_tokens = u.cache_read_input_tokens ?? 0;
+              } else if (event.type === 'message_delta' && event.usage) {
+                usage.output_tokens = event.usage.output_tokens ?? usage.output_tokens;
+                sawMessageDelta = true;
+              }
+            } catch {
+              // skip malformed event lines
+            }
+          }
+        }
+      } catch (err) {
+        controller.error(err);
+        return;
+      }
+      // Only fire onUsage on a clean run — partial usage from a half-read
+      // stream would skew the cache-hit-ratio aggregate.
+      if (sawMessageDelta && onUsage) {
+        try {
+          await onUsage(usage);
+        } catch (err) {
+          // Don't fail the stream over an instrumentation error.
+          console.error('anthropic onUsage callback failed', err);
+        }
+      }
+      controller.close();
+    },
+    async cancel(reason) {
+      // Client disconnected mid-stream — stop reading from Anthropic so
+      // they stop generating (and billing) tokens nobody will see.
+      if (reader) {
+        try {
+          await reader.cancel(reason);
+        } catch {
+          // Reader may already be closed/errored — nothing more to do.
+        }
+      }
+    },
+  });
+}

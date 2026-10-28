@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>MathIQ — math problems, walked through</title>
+    <meta name="description" content="A guided math tutor for college courses. Type a problem, walk through it one line at a time." />
+
+    <!-- Open Graph / social previews. Per-share dynamic tags would
+         require a Vercel edge function rendering HTML with the specific
+         shareId's data; for now these are generic but make pasted MathIQ
+         links look professional in iMessage / Discord / Twitter / Slack. -->
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="MathIQ" />
+    <meta property="og:title" content="MathIQ" />
+    <meta property="og:description" content="One math problem a day, randomly picked from 109 college topics. Solve it on paper, snap a photo, get graded. Wordle-style daily math." />
+    <meta property="og:image" content="https://mathiq.io/icon-192.png" />
+    <meta property="og:url" content="https://mathiq.io" />
+
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="MathIQ" />
+    <meta name="twitter:description" content="One math problem a day. Solve, photo-grade, share." />
+    <meta name="twitter:image" content="https://mathiq.io/icon-192.png" />
+
+    <!-- PWA -->
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <meta name="theme-color" content="#f2e4dc" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/favicon.png" />
+    <link rel="apple-touch-icon" href="/icon-192.png" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="MathIQ" />
+
+    <!-- Resolves the stored palette before first paint. Deferring this to
+         React flashes the default palette on every load, which is worst on
+         exactly the dark themes someone picked to avoid glare. Mirrors
+         resolveTheme() in src/state/theme.ts — including the 7am-7pm daylight
+         window — and must keep mirroring it. Kept dependency-free. -->
+    <script>
+      (function () {
+        try {
+          var ls = localStorage;
+          var mode = ls.getItem('mathiq:themeMode');
+          if (mode !== 'light' && mode !== 'dark') mode = 'auto';
+          var light = ls.getItem('mathiq:themeLight') || 'clay';
+          var dark = ls.getItem('mathiq:themeDark') || 'warm-brown';
+          var known = ['pistachio','parchment','chalk','clay',
+                       'warm-brown','soft-sage','deep-swamp','moss-and-gold'];
+          if (known.indexOf(light) < 0) light = 'clay';
+          if (known.indexOf(dark) < 0) dark = 'warm-brown';
+          var h = new Date().getHours();
+          var night =
+            h < 7 || h >= 19 || matchMedia('(prefers-color-scheme: dark)').matches;
+          var id =
+            mode === 'light'
+              ? light
+              : mode === 'dark'
+                ? dark
+                : night
+                  ? dark
+                  : light;
+          document.documentElement.setAttribute('data-theme', id);
+          var chrome = getComputedStyle(document.documentElement)
+            .getPropertyValue('--paper')
+            .trim();
+          if (chrome) {
+            document
+              .querySelector('meta[name="theme-color"]')
+              .setAttribute('content', chrome);
+          }
+        } catch (e) {}
+      })();
+    </script>
+
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&family=JetBrains+Mono:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+
+    <!-- Cloudflare Turnstile (abuse protection for anonymous daily-challenge grading) -->
+    <!-- <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script> -->
+
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

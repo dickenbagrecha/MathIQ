@@ -1,0 +1,339 @@
+/**
+ * Public read-only view of a shared Daily Challenge attempt.
+ *
+ * Lands here from a /share/:id deep link (typically tapped from someone's
+ * social post). Shows the challenge problem, the sharer's grade, and if
+ * they rendered a typeset PDF — the PDF embedded inline as the centerpiece.
+ *
+ * No auth required. Anonymous viewers see the same content as signed-in.
+ * Privacy: the page never reveals the sharer's userId or identity.
+ */
+import { useMemo } from 'react';
+import katex from 'katex';
+import { T } from '../design/tokens';
+import { kicker as kickerStyle } from '../design/primitives';
+import { CheckIcon, CrossIcon, DifficultyChip } from '../design/icons';
+import { MathMarkdown } from '../components/MathMarkdown';
+import { useAsync } from '../hooks/useAsync';
+import {
+  fetchSharedAttempt,
+  type SharedChallenge,
+} from '../billing/challenge';
+
+// Local: Share's kicker historically had no marginBottom — callers
+// override via spread when they want spacing. Pin to 0 to preserve that.
+const kicker = () => kickerStyle(0);
+
+/**
+ * Render a short LaTeX string inline (no block wrapper). Used for the
+ * one-liner "their answer" callouts — the grader emits things like
+ * "x = 4" or "x = \\frac{1}{2}" without delimiters, so we strip any
+ * stray $ from the edges and ask KaTeX to render in inline mode.
+ *
+ * If KaTeX fails, falls back to the raw string so the page never goes
+ * blank — rendered as text, never as HTML. KaTeX rethrows anything that
+ * isn't a ParseError even with throwOnError off (a RangeError from deep
+ * nesting, say), and this value crossed a share link, so on that path it
+ * is untrusted input and must not reach innerHTML.
+ */
+function InlineMath({ value }: { value: string }) {
+  const rendered = useMemo(() => {
+    const cleaned = value.replace(/^\$+|\$+$/g, '').trim();
+    try {
+      return {
+        html: katex.renderToString(cleaned, {
+          throwOnError: false,
+          displayMode: false,
+        }),
+      };
+    } catch {
+      return { text: cleaned };
+    }
+  }, [value]);
+  if ('text' in rendered) return <span>{rendered.text}</span>;
+  return <span dangerouslySetInnerHTML={{ __html: rendered.html }} />;
+}
+
+interface ShareProps {
+  shareId: string;
+}
+
+export function Share({ shareId }: ShareProps) {
+  const { data, loading, error } = useAsync(async (signal) => {
+    let d: SharedChallenge | null;
+    try {
+      d = await fetchSharedAttempt(shareId, signal);
+    } catch (err) {
+      if (signal.aborted) throw err;
+      // fetch() rejects with a bare "Failed to fetch" for anything from
+      // airplane mode to a blocked request — not copy anyone can act on.
+      throw new Error("Couldn't reach MathIQ. Check your connection and try again.");
+    }
+    if (!d) throw new Error("This shared challenge expired or wasn't found.");
+    return d;
+  }, [shareId]);
+
+  return (
+    <main
+      className="responsive-pad"
+      style={{
+        maxWidth: 760,
+        margin: '0 auto',
+        paddingTop: 32,
+        paddingBottom: 80,
+        minHeight: '100vh',
+      }}
+    >
+      <a
+        href="/"
+        className="btn-press"
+        style={{
+          display: 'inline-block',
+          fontSize: 13,
+          fontFamily: T.mono,
+          letterSpacing: '0.1em',
+          textTransform: 'uppercase',
+          color: T.muted,
+          textDecoration: 'none',
+          marginBottom: 24,
+        }}
+      >
+        ← MathIQ
+      </a>
+
+      {loading && <LoadingState />}
+
+      {error && (
+        <div
+          style={{
+            padding: '24px 22px',
+            border: `1px solid ${T.ink}`,
+            background: T.paper2,
+          }}
+        >
+          <div style={kicker()}>SHARED CHALLENGE</div>
+          <p style={{ marginTop: 12, fontSize: 15, color: T.muted, lineHeight: 1.55 }}>
+            {error.message}
+          </p>
+          <a
+            href="/"
+            className="btn-press chamfer"
+            style={{
+              display: 'inline-block',
+              marginTop: 16,
+              background: T.accent,
+              color: T.paper,
+              border: 'none',
+              padding: '10px 18px',
+              fontSize: 14,
+              fontWeight: 600,
+              fontFamily: T.sans,
+              textDecoration: 'none',
+            }}
+          >
+            Try today's challenge →
+          </a>
+        </div>
+      )}
+
+      {data && <SharedView data={data} />}
+    </main>
+  );
+}
+
+function SharedView({ data }: { data: SharedChallenge }) {
+  return (
+    <>
+      {/* Hero */}
+      <header style={{ marginBottom: 28 }}>
+        <div
+          style={{
+            ...kicker(),
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 10,
+          }}
+        >
+          <span>MATHIQ DAILY #{data.challengeNumber}</span>
+          <span aria-hidden>·</span>
+          <DifficultyChip tier={data.difficulty} />
+        </div>
+        <h1
+          style={{
+            fontFamily: T.sans,
+            fontSize: 'clamp(28px, 5vw, 40px)',
+            fontWeight: 700,
+            lineHeight: 1.05,
+            letterSpacing: '-0.02em',
+            margin: '8px 0 8px',
+          }}
+        >
+          {data.courseTitle} · {data.topicTitle}
+        </h1>
+        <p style={{ fontSize: 14, color: T.muted, margin: 0, fontFamily: T.mono, letterSpacing: '0.06em' }}>
+          {formatDate(data.date)}
+        </p>
+      </header>
+
+      {/* The problem */}
+      <section
+        style={{
+          padding: '20px 22px',
+          border: `1px solid ${T.ink}`,
+          background: T.paper2,
+          marginBottom: 18,
+        }}
+      >
+        <div style={kicker()}>THE PROBLEM</div>
+        <MathMarkdown
+          style={{
+            marginTop: 10,
+            fontSize: 17,
+            lineHeight: 1.55,
+            color: T.ink,
+          }}
+        >
+          {data.problemText}
+        </MathMarkdown>
+      </section>
+
+      {/* Verdict */}
+      <section
+        style={{
+          padding: '20px 22px',
+          border: `1px solid ${T.ink}`,
+          background: data.grade.correct ? T.paper2 : T.paper,
+          marginBottom: data.studentMmd ? 18 : 28,
+        }}
+      >
+        <div style={{ ...kicker(), display: 'flex', alignItems: 'center', gap: 8 }}>
+          {data.grade.correct ? (
+            <>
+              <CheckIcon /> SOLVED
+            </>
+          ) : (
+            <>
+              <CrossIcon /> NOT QUITE
+            </>
+          )}
+        </div>
+        {data.grade.studentAnswer && (
+          <div
+            style={{
+              marginTop: 10,
+              fontSize: 15,
+              color: T.ink,
+              display: 'flex',
+              alignItems: 'baseline',
+              gap: 6,
+              flexWrap: 'wrap',
+            }}
+          >
+            <span>Their answer:</span>
+            <strong>
+              <InlineMath value={data.grade.studentAnswer} />
+            </strong>
+          </div>
+        )}
+        {data.grade.feedback && (
+          <p style={{ marginTop: 6, fontSize: 14, color: T.muted, lineHeight: 1.55 }}>
+            {data.grade.feedback}
+          </p>
+        )}
+      </section>
+
+      {/* Their submitted work — rendered inline via KaTeX from the MMD the
+       *  student sent in (typed or OCR'd from a photo). No PDF round-trip;
+       *  the same renderer used for the problem above handles math here. */}
+      {data.studentMmd && (
+        <section style={{ marginBottom: 28 }}>
+          <div style={{ ...kicker(), marginBottom: 8 }}>THEIR WORK</div>
+          <MathMarkdown
+            style={{
+              padding: '20px 22px',
+              border: `1px solid ${T.ink}`,
+              background: T.doc,
+              fontSize: 16,
+              lineHeight: 1.6,
+              // The document surface is always white, so its text can't ride
+              // the theme — a dark palette's pale ink would vanish on it.
+              color: T.docInk,
+              overflowX: 'auto',
+            }}
+          >
+            {data.studentMmd}
+          </MathMarkdown>
+        </section>
+      )}
+
+      {/* Footer CTA */}
+      <section
+        style={{
+          padding: '24px 22px',
+          border: `1px solid ${T.ink}`,
+          background: T.paper,
+          textAlign: 'center',
+        }}
+      >
+        <div style={kicker()}>YOUR TURN</div>
+        <p
+          style={{
+            marginTop: 10,
+            fontSize: 16,
+            color: T.ink,
+            lineHeight: 1.5,
+          }}
+        >
+          Solve today's MathIQ Daily Challenge and share your own typeset solution.
+        </p>
+        <a
+          href="/"
+          className="btn-press chamfer"
+          style={{
+            display: 'inline-block',
+            marginTop: 16,
+            background: T.accent,
+            color: T.paper,
+            border: 'none',
+            padding: '12px 22px',
+            fontSize: 15,
+            fontWeight: 600,
+            fontFamily: T.sans,
+            textDecoration: 'none',
+          }}
+        >
+          Try today's challenge →
+        </a>
+      </section>
+    </>
+  );
+}
+
+function LoadingState() {
+  return (
+    <div
+      style={{
+        padding: '24px 22px',
+        border: `1px solid ${T.hair}`,
+        background: T.paper2,
+        opacity: 0.7,
+      }}
+    >
+      <div style={kicker()}>LOADING…</div>
+      <div style={{ height: 28, width: '60%', background: T.hair, marginTop: 14 }} />
+      <div style={{ height: 18, width: '90%', background: T.hair, marginTop: 12 }} />
+      <div style={{ height: 18, width: '70%', background: T.hair, marginTop: 6 }} />
+    </div>
+  );
+}
+
+function formatDate(date: string): string {
+  const [y, m, d] = date.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return dt.toLocaleDateString(undefined, {
+    weekday: 'long',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+  });
+}
